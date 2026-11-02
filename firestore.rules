@@ -1,0 +1,499 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default-deny global safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string &&
+        id.size() >= 1 &&
+        id.size() <= 128 &&
+        id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOptionalString(data, key, maxLen) {
+      return !(key in data) ||
+        data[key] == null ||
+        (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        (request.auth.token.email == 'qikacreative@gmail.com' ||
+         request.auth.token.email == 'iqbalsaefinnuha@gmail.com' ||
+         request.auth.token.email == '2kafilasuci1@gmail.com' ||
+         request.auth.token.email == 'hpqkcreative25@gmail.com' ||
+         request.auth.token.email == 'hpsucikkusumah23@gmail.com');
+    }
+
+    function isOwnerOfLaundry(laundryId) {
+      return isSignedIn() && (
+        isSuperAdmin() ||
+        (exists(/databases/$(database)/documents/laundries/$(laundryId)) &&
+         get(/databases/$(database)/documents/laundries/$(laundryId)).data.ownerId == request.auth.uid)
+      );
+    }
+
+    function isStaffOfLaundry(laundryId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/laundries/$(laundryId)/staff/$(request.auth.uid));
+    }
+
+    function canAccessLaundry(laundryId) {
+      return isOwnerOfLaundry(laundryId) || isStaffOfLaundry(laundryId);
+    }
+
+    function isValidUserSafeFields(data) {
+      return (!('displayName' in data) ||
+          (data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120)) &&
+        isOptionalString(data, 'username', 120) &&
+        isOptionalString(data, 'nomorTelepon', 40) &&
+        isOptionalString(data, 'emailOrPhone', 160) &&
+        isOptionalString(data, 'authEmail', 160) &&
+        (!('laundryId' in data) ||
+          (data.laundryId is string && data.laundryId.size() >= 1 && data.laundryId.size() <= 128)) &&
+        (!('laundries' in data) ||
+          (data.laundries is map && data.laundries.size() <= 25));
+    }
+
+    function isUserBillingAndIdentityImmutable() {
+      return incoming().uid == existing().uid &&
+        incoming().role == existing().role &&
+        incoming().get('ownerId', null) == existing().get('ownerId', null) &&
+        incoming().get('walletBalance', 0) == existing().get('walletBalance', 0) &&
+        incoming().get('subscriptionType', 'newcomer') == existing().get('subscriptionType', 'newcomer') &&
+        incoming().get('subscriptionEndDate', null) == existing().get('subscriptionEndDate', null) &&
+        incoming().get('lastSettledOrderId', null) == existing().get('lastSettledOrderId', null) &&
+        incoming().get('createdAt', null) == existing().get('createdAt', null);
+    }
+
+    function isValidOwnerWalletExtend(userId) {
+      return request.auth.uid == userId &&
+        existing().role == 'owner' &&
+        incoming().uid == userId &&
+        incoming().role == 'owner' &&
+        incoming().get('ownerId', null) == existing().get('ownerId', null) &&
+        incoming().get('createdAt', null) == existing().get('createdAt', null) &&
+        incoming().walletBalance is number &&
+        existing().walletBalance is number &&
+        incoming().walletBalance >= 0 &&
+        incoming().walletBalance < existing().walletBalance &&
+        (existing().walletBalance - incoming().walletBalance) >= 27000 &&
+        incoming().subscriptionType == 'premium' &&
+        incoming().subscriptionEndDate is number &&
+        incoming().subscriptionEndDate > request.time.toMillis() &&
+        incoming().updatedAt is number &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'walletBalance',
+          'subscriptionType',
+          'subscriptionEndDate',
+          'updatedAt'
+        ]);
+    }
+
+    function isValidNewOwnerCreate(userId) {
+      return request.auth.uid == userId &&
+        incoming().keys().hasAll(['uid', 'role', 'laundryId', 'walletBalance', 'subscriptionType']) &&
+        incoming().keys().hasOnly([
+          'uid',
+          'emailOrPhone',
+          'authEmail',
+          'username',
+          'displayName',
+          'nomorTelepon',
+          'role',
+          'laundryId',
+          'laundries',
+          'walletBalance',
+          'createdAt',
+          'updatedAt',
+          'subscriptionType',
+          'subscriptionEndDate'
+        ]) &&
+        incoming().uid == userId &&
+        incoming().role == 'owner' &&
+        incoming().walletBalance == 0 &&
+        incoming().subscriptionType == 'newcomer' &&
+        incoming().get('subscriptionEndDate', null) == null &&
+        isValidUserSafeFields(incoming());
+    }
+
+    function isValidCashierCreateByOwner(userId) {
+      let ownerDocPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      return request.auth.uid != userId &&
+        incoming().keys().hasAll(['uid', 'ownerId', 'role', 'laundryId', 'walletBalance', 'displayName']) &&
+        incoming().keys().hasOnly([
+          'uid',
+          'ownerId',
+          'emailOrPhone',
+          'authEmail',
+          'username',
+          'displayName',
+          'nomorTelepon',
+          'role',
+          'laundryId',
+          'laundries',
+          'walletBalance',
+          'subscriptionType',
+          'subscriptionEndDate',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        incoming().uid == userId &&
+        (incoming().role == 'admin' || incoming().role == 'karyawan') &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().walletBalance == 0 &&
+        isValidUserSafeFields(incoming()) &&
+        exists(ownerDocPath) &&
+        get(ownerDocPath).data.get('subscriptionType', 'newcomer') == 'premium' &&
+        incoming().get('subscriptionType', 'newcomer') == 'premium' &&
+        incoming().get('subscriptionEndDate', null) == get(ownerDocPath).data.get('subscriptionEndDate', null) &&
+        isOwnerOfLaundry(incoming().laundryId);
+    }
+
+    function isValidPrimaryBranchCreate(laundryId) {
+      let userDocPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      return laundryId == ('lnd-' + request.auth.uid) &&
+        incoming().keys().hasAll(['id', 'ownerId', 'namaLaundry']) &&
+        incoming().keys().hasOnly([
+          'id',
+          'ownerId',
+          'namaLaundry',
+          'alamat',
+          'nomorTelepon',
+          'subscriptionType',
+          'subscriptionEndDate',
+          'updatedAt'
+        ]) &&
+        incoming().id == laundryId &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().namaLaundry is string &&
+        incoming().namaLaundry.size() >= 1 &&
+        incoming().namaLaundry.size() <= 120 &&
+        isOptionalString(incoming(), 'alamat', 300) &&
+        isOptionalString(incoming(), 'nomorTelepon', 40) &&
+        (
+          (incoming().get('subscriptionType', 'newcomer') == 'newcomer' &&
+           incoming().get('subscriptionEndDate', null) == null) ||
+          (exists(userDocPath) &&
+           incoming().get('subscriptionType', 'newcomer') == get(userDocPath).data.get('subscriptionType', 'newcomer') &&
+           incoming().get('subscriptionEndDate', null) == get(userDocPath).data.get('subscriptionEndDate', null))
+        );
+    }
+
+    function isValidBranchProfileUpdate() {
+      return existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().id == existing().id &&
+        incoming().get('subscriptionType', null) == existing().get('subscriptionType', null) &&
+        incoming().get('subscriptionEndDate', null) == existing().get('subscriptionEndDate', null) &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'id',
+          'namaLaundry',
+          'alamat',
+          'nomorTelepon',
+          'updatedAt'
+        ]) &&
+        incoming().namaLaundry is string &&
+        incoming().namaLaundry.size() >= 1 &&
+        incoming().namaLaundry.size() <= 120 &&
+        isOptionalString(incoming(), 'alamat', 300) &&
+        isOptionalString(incoming(), 'nomorTelepon', 40);
+    }
+
+    function isValidBranchSubscriptionUpdate() {
+      return existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().id == existing().id &&
+        incoming().subscriptionType == 'premium' &&
+        incoming().subscriptionEndDate is number &&
+        incoming().subscriptionEndDate > request.time.toMillis() &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'subscriptionType',
+          'subscriptionEndDate',
+          'updatedAt'
+        ]);
+    }
+
+    match /brands_registry/{slug} {
+      allow read: if true;
+      allow create: if isSignedIn() && isValidId(slug);
+      allow update, delete: if isSuperAdmin() || (
+        isSignedIn() &&
+        isValidId(slug) &&
+        (!('ownerUid' in resource.data) || resource.data.ownerUid == request.auth.uid)
+      );
+    }
+
+    match /tim_studio/{uid} {
+      allow read, write: if isSignedIn() && isValidId(uid) && (request.auth.uid == uid || isSuperAdmin());
+    }
+
+    match /owners/{ownerId} {
+      allow get: if isSignedIn() && isValidId(ownerId) && (request.auth.uid == ownerId || isSuperAdmin());
+      allow list: if isSuperAdmin();
+      allow create: if isSuperAdmin() || (
+        isSignedIn() &&
+        isValidId(ownerId) &&
+        request.auth.uid == ownerId &&
+        incoming().get('paketAktif', 'newcomer') == 'newcomer' &&
+        incoming().get('walletBalance', 0) == 0 &&
+        incoming().get('subscriptionType', 'newcomer') == 'newcomer' &&
+        incoming().get('subscriptionEndDate', null) == null
+      );
+      allow update: if isSuperAdmin() || (
+        isSignedIn() &&
+        isValidId(ownerId) &&
+        request.auth.uid == ownerId && (
+          (
+            incoming().get('paketAktif', null) == existing().get('paketAktif', null) &&
+            incoming().get('tanggalLangganan', null) == existing().get('tanggalLangganan', null) &&
+            incoming().get('walletBalance', 0) == existing().get('walletBalance', 0) &&
+            incoming().get('subscriptionType', null) == existing().get('subscriptionType', null) &&
+            incoming().get('subscriptionEndDate', null) == existing().get('subscriptionEndDate', null)
+          ) || (
+            incoming().subscriptionType == 'premium' &&
+            incoming().get('walletBalance', 0) < existing().get('walletBalance', 0)
+          )
+        )
+      );
+      allow delete: if isSuperAdmin();
+
+      match /paket_layanan/{docId} {
+        allow read: if true;
+        allow write: if isSignedIn() && (request.auth.uid == ownerId || isSuperAdmin());
+      }
+
+      match /jadwal/{docId} {
+        allow read: if isSignedIn() && (request.auth.uid == ownerId || isSuperAdmin());
+        allow create: if (request.resource.data.sumber == 'WEB' && request.resource.data.status == 'Booking Web') ||
+          (isSignedIn() && (request.auth.uid == ownerId || isSuperAdmin()));
+        allow update, delete: if isSignedIn() && (request.auth.uid == ownerId || isSuperAdmin());
+      }
+
+      match /{subcollection}/{docId} {
+        allow read, write: if isSignedIn() && (request.auth.uid == ownerId || isSuperAdmin());
+      }
+    }
+
+    match /topup_requests/{reqId} {
+      allow get: if isSuperAdmin() || (isSignedIn() && isValidId(reqId) && resource != null && resource.data.ownerUid == request.auth.uid);
+      allow list: if isSuperAdmin() || (isSignedIn() && resource.data.ownerUid == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(reqId) && request.resource.data.ownerUid == request.auth.uid;
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // Catatan pesanan Midtrans: Read-only bagi pemilik; penulisan HANYA oleh backend Service Account / Super Admin
+    match /payment_orders/{orderId} {
+      allow get: if isSignedIn() && isValidId(orderId) && (
+        isSuperAdmin() ||
+        (resource != null && resource.data.ownerId == request.auth.uid)
+      );
+      allow list: if isSignedIn() && (
+        isSuperAdmin() ||
+        resource.data.ownerId == request.auth.uid
+      );
+      allow create, update: if isSuperAdmin();
+      allow delete: if false;
+    }
+
+    // Buku besar audit billing: Append-only khusus backend Service Account / Super Admin atau Owner yang memperpanjang langsung dari dompet
+    match /billing_audit_logs/{logId} {
+      allow get: if isSignedIn() && isValidId(logId) && (
+        isSuperAdmin() ||
+        (resource != null && resource.data.uid == request.auth.uid)
+      );
+      allow list: if isSignedIn() && (
+        isSuperAdmin() ||
+        resource.data.uid == request.auth.uid
+      );
+      allow create: if isSuperAdmin() || (
+        isSignedIn() &&
+        isValidId(logId) &&
+        incoming().uid == request.auth.uid &&
+        incoming().actorUid == request.auth.uid &&
+        incoming().action == 'wallet_extend_premium' &&
+        incoming().channel == 'WALLET' &&
+        incoming().amount is number &&
+        incoming().amount >= 27000 &&
+        incoming().walletDelta == -incoming().amount &&
+        incoming().walletBefore is number &&
+        incoming().walletAfter is number &&
+        incoming().walletAfter == incoming().walletBefore - incoming().amount &&
+        incoming().walletAfter >= 0 &&
+        incoming().durationDays is number &&
+        incoming().durationDays >= 30 &&
+        incoming().subscriptionTypeAfter == 'premium' &&
+        incoming().subscriptionEndDateAfter is number &&
+        incoming().createdAt is number
+      );
+      allow update, delete: if false;
+    }
+
+    // Profil pengguna: walletBalance, subscriptionType, subscriptionEndDate, role & uid dikunci mutlak dari mutasi client reguler kecuali eksekusi perpanjangan dari saldo yang valid
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (
+        request.auth.uid == userId ||
+        (resource != null && resource.data.get('ownerId', '') == request.auth.uid) ||
+        isSuperAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.get('ownerId', '') == request.auth.uid ||
+        isSuperAdmin()
+      );
+      allow create: if isSignedIn() && isValidId(userId) && (
+        isSuperAdmin() ||
+        isValidNewOwnerCreate(userId) ||
+        isValidCashierCreateByOwner(userId)
+      );
+      allow update: if isSignedIn() && isValidId(userId) && (
+        isSuperAdmin() ||
+        isValidOwnerWalletExtend(userId) ||
+        (
+          request.auth.uid == userId &&
+          isValidUserSafeFields(incoming()) &&
+          isUserBillingAndIdentityImmutable() &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName',
+            'username',
+            'nomorTelepon',
+            'emailOrPhone',
+            'authEmail',
+            'laundries',
+            'laundryId',
+            'gajiTerakhir',
+            'tanggalGajian',
+            'bayarGajiOtomatis',
+            'updatedAt'
+          ])
+        ) ||
+        (
+          (existing().role == 'admin' || existing().role == 'karyawan') &&
+          existing().get('ownerId', '') == request.auth.uid &&
+          incoming().get('ownerId', '') == request.auth.uid &&
+          incoming().uid == userId &&
+          (incoming().role == 'admin' || incoming().role == 'karyawan') &&
+          incoming().get('walletBalance', 0) == 0 &&
+          isValidUserSafeFields(incoming()) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName',
+            'username',
+            'nomorTelepon',
+            'emailOrPhone',
+            'authEmail',
+            'laundryId',
+            'laundries',
+            'subscriptionType',
+            'subscriptionEndDate',
+            'updatedAt'
+          ]) &&
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('subscriptionType', 'newcomer') == 'premium' &&
+          incoming().get('subscriptionType', 'newcomer') == 'premium' &&
+          incoming().get('subscriptionEndDate', null) == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('subscriptionEndDate', null) &&
+          isOwnerOfLaundry(incoming().laundryId)
+        )
+      );
+      allow delete: if isSignedIn() && isValidId(userId) && (
+        isSuperAdmin() ||
+        (
+          (resource.data.role == 'admin' || resource.data.role == 'karyawan') &&
+          resource.data.get('ownerId', '') == request.auth.uid
+        )
+      );
+    }
+
+    // Cabang laundry: hanya cabang utama awal (lnd-{uid}) yang dapat dibuat dari client; cabang ke-2+ wajib lewat backend berbayar
+    match /laundries/{laundryId} {
+      allow get: if isSignedIn() && isValidId(laundryId) && (
+        resource == null ||
+        resource.data.ownerId == request.auth.uid ||
+        isStaffOfLaundry(laundryId) ||
+        isSuperAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.ownerId == request.auth.uid ||
+        isSuperAdmin()
+      );
+      allow create: if isSignedIn() && isValidId(laundryId) && (
+        isSuperAdmin() ||
+        isValidPrimaryBranchCreate(laundryId)
+      );
+      allow update: if isSignedIn() && isValidId(laundryId) && (
+        isSuperAdmin() ||
+        isValidBranchProfileUpdate() ||
+        isValidBranchSubscriptionUpdate()
+      );
+      allow delete: if isSignedIn() && isValidId(laundryId) && (
+        resource.data.ownerId == request.auth.uid ||
+        isSuperAdmin()
+      );
+
+      match /staff/{staffUid} {
+        allow read: if canAccessLaundry(laundryId);
+        allow create, update, delete: if isOwnerOfLaundry(laundryId);
+      }
+
+      match /transaksi/{transaksiId} {
+        allow read, create, update: if canAccessLaundry(laundryId);
+        allow delete: if isOwnerOfLaundry(laundryId);
+      }
+
+      match /pelanggan/{pelangganId} {
+        allow read, create, update: if canAccessLaundry(laundryId);
+        allow delete: if isOwnerOfLaundry(laundryId);
+      }
+
+      match /pengeluaran/{pengeluaranId} {
+        allow read, create: if canAccessLaundry(laundryId);
+        allow update, delete: if isOwnerOfLaundry(laundryId);
+      }
+
+      match /layanan/{layananId} {
+        allow read: if canAccessLaundry(laundryId);
+        allow write: if isOwnerOfLaundry(laundryId);
+      }
+
+      match /settings/{docId} {
+        allow read: if canAccessLaundry(laundryId);
+        allow write: if isOwnerOfLaundry(laundryId);
+      }
+
+      match /{subcollection}/{docId} {
+        allow read: if canAccessLaundry(laundryId);
+        allow write: if isOwnerOfLaundry(laundryId);
+      }
+    }
+
+    match /app_config/{configId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSuperAdmin() &&
+        isValidId(configId) &&
+        request.resource.data.keys().hasOnly(['backendUrl', 'updatedAt']) &&
+        request.resource.data.backendUrl is string &&
+        request.resource.data.backendUrl.size() <= 300 &&
+        request.resource.data.updatedAt is int;
+      allow delete: if isSuperAdmin();
+    }
+
+    match /test/{docId} {
+      allow read: if true;
+    }
+  }
+}

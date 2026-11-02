@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Kafelas Wash - Kasir Cuci Mobil & Motor</title>
+    <meta name="description" content="Aplikasi Kasir, Manajemen Antrean, dan Operasional Cuci Mobil, Motor & Auto Detailing" />
+    <meta property="og:title" content="Kafelas Wash - Kasir Cuci Mobil & Motor" />
+    <meta property="og:description" content="Aplikasi Kasir, Manajemen Antrean, dan Operasional Cuci Mobil, Motor & Auto Detailing" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#800000" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Kafelas Wash" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <script>
+      (function () {
+        window.__KAFELAS_MOUNTED__ = false;
+        console.info('[Kafelas Boot] Memulai pemuatan dokumen utama:', window.location.pathname);
+
+        function purgeSwAndReloadOnce(reason) {
+          try {
+            var key = 'kafelas_sw_autorecover_v2';
+            if (sessionStorage.getItem(key) === '1') {
+              console.warn('[Kafelas Boot] Auto-recovery sudah dijalankan sesi ini (' + reason + ').');
+              return false;
+            }
+            sessionStorage.setItem(key, '1');
+          } catch (e) {
+            return false;
+          }
+
+          console.warn('[Kafelas Boot] Memulihkan cache Service Worker otomatis karena:', reason);
+          var tasks = [];
+          if ('serviceWorker' in navigator && navigator.serviceWorker.getRegistrations) {
+            tasks.push(
+              navigator.serviceWorker.getRegistrations().then(function (regs) {
+                return Promise.all(
+                  regs.map(function (r) {
+                    return r.unregister();
+                  })
+                );
+              })
+            );
+          }
+          if ('caches' in window && caches.keys) {
+            tasks.push(
+              caches.keys().then(function (names) {
+                return Promise.all(
+                  names.map(function (n) {
+                    return caches.delete(n);
+                  })
+                );
+              })
+            );
+          }
+          Promise.all(tasks)
+            .catch(function () {})
+            .then(function () {
+              window.location.reload();
+            });
+          return true;
+        }
+
+        window.addEventListener(
+          'error',
+          function (event) {
+            if (window.__KAFELAS_MOUNTED__) return;
+            var target = event && event.target;
+            var isAssetError =
+              target &&
+              (target.tagName === 'SCRIPT' || target.tagName === 'LINK') &&
+              (target.src || target.href || '').indexOf('/assets/') !== -1;
+            var msg = (event && event.message) || '';
+            var isChunkError =
+              msg.indexOf('Failed to fetch dynamically imported module') !== -1 ||
+              msg.indexOf('Importing a module script failed') !== -1 ||
+              msg.indexOf('MIME type') !== -1;
+
+            if (isAssetError || isChunkError) {
+              purgeSwAndReloadOnce(isAssetError ? 'asset-load-failed' : msg);
+            }
+          },
+          true
+        );
+
+        window.addEventListener('vite:preloadError', function (event) {
+          if (event && event.preventDefault) event.preventDefault();
+          purgeSwAndReloadOnce('vite:preloadError');
+        });
+
+        window.setTimeout(function () {
+          if (window.__KAFELAS_MOUNTED__) return;
+          console.error('[Kafelas Boot] Bundle React belum terpasang setelah batas waktu tunggu.');
+          if (purgeSwAndReloadOnce('boot-timeout')) return;
+
+          var root = document.getElementById('root');
+          if (!root || root.childNodes.length > 0) return;
+
+          var wrapper = document.createElement('div');
+          wrapper.className =
+            'min-h-screen flex flex-col items-center justify-center bg-slate-100 text-slate-800 font-sans p-6 text-center';
+
+          var card = document.createElement('div');
+          card.className =
+            'w-full max-w-sm bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-4';
+
+          var title = document.createElement('h1');
+          title.className = 'text-base font-bold text-slate-900';
+          title.textContent = 'Koneksi Lambat atau Cache Perlu Disegarkan';
+
+          var desc = document.createElement('p');
+          desc.className = 'text-xs text-slate-600 leading-relaxed';
+          desc.textContent =
+            'Aplikasi belum berhasil dimuat karena jaringan terputus atau cache lama perangkat. Data transaksi lokal Anda tetap aman.';
+
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className =
+            'w-full bg-[#800000] text-white rounded-xl px-4 py-2.5 text-xs font-bold shadow-sm cursor-pointer';
+          btn.textContent = 'Segarkan Cache & Muat Ulang';
+          btn.onclick = function () {
+            btn.disabled = true;
+            btn.textContent = 'Menyegarkan...';
+            (async function () {
+              try {
+                if ('serviceWorker' in navigator) {
+                  var r = await navigator.serviceWorker.getRegistrations();
+                  for (var i = 0; i < r.length; i++) await r[i].unregister();
+                }
+                if ('caches' in window) {
+                  var k = await caches.keys();
+                  for (var j = 0; j < k.length; j++) await caches.delete(k[j]);
+                }
+              } catch (e) {}
+              window.location.href = window.location.pathname + '?_cb=' + Date.now();
+            })();
+          };
+
+          card.appendChild(title);
+          card.appendChild(desc);
+          card.appendChild(btn);
+          wrapper.appendChild(card);
+          root.appendChild(wrapper);
+        }, 9000);
+      })();
+    </script>
+  </head>
+  <body class="bg-slate-100">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

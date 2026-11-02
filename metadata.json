@@ -1,0 +1,8 @@
+{
+  "name": "Kafelas Wash - Kasir Cuci Mobil & Motor",
+  "description": "Aplikasi Kasir, Manajemen Antrean, dan Operasional Cuci Mobil, Motor & Auto Detailing",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

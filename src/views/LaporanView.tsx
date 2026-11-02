@@ -1,0 +1,2597 @@
+import React, { Suspense, lazy, useState, useMemo, useEffect } from 'react';
+import {
+  ArrowLeft,
+  ChevronDown,
+  ChevronUp,
+  TrendingUp,
+  TrendingDown,
+  FileSpreadsheet,
+  Printer,
+  Sparkles,
+  DollarSign,
+  ArrowUpRight,
+  ArrowDownRight,
+  Scale,
+  Calendar,
+  CheckCircle2,
+  AlertCircle,
+  HelpCircle,
+  Download,
+  Lock,
+  Crown,
+  BarChart3,
+  LineChart,
+  Layers,
+  Award,
+  Zap,
+  Activity,
+  Info,
+  Building2,
+  Users,
+} from 'lucide-react';
+import { Transaksi, Pengeluaran, SettingsData, Laundry, StaffPerformanceSummary } from '../types';
+import { formatRupiah, formatShortDate, formatReceiptDate, formatLocalDateKey, extractTransaksiCashInEntries } from '../utils/formatters';
+import { FirebaseSyncService } from '../utils/firebaseSync';
+import { StorageService, defaultSettings } from '../utils/storage';
+import { IndexedDbService } from '../utils/indexedDb';
+import type { LaporanSummaryExportData } from '../utils/excelExport';
+import type { LaporanPdfData } from '../utils/pdfExport';
+import { useToast } from '../components/NotificationContext';
+import { getLaundryLimits } from '../utils/subscription';
+import type { BranchPerformanceData } from '../components/BranchComparisonD3Chart';
+
+const LazyReportPdfModal = lazy(() =>
+  import('../components/ReportPdfModal').then((m) => ({ default: m.ReportPdfModal }))
+);
+const LazyBranchComparisonD3Chart = lazy(() =>
+  import('../components/BranchComparisonD3Chart').then((m) => ({
+    default: m.BranchComparisonD3Chart,
+  }))
+);
+
+interface LaporanViewProps {
+  onBack: () => void;
+  transaksiList: Transaksi[];
+  pengeluaranList: Pengeluaran[];
+  activeLaundryId: string;
+  laundryName?: string;
+  currentTier?: string | null;
+  onOpenUpgradeModal?: (reason?: string) => void;
+  laundries?: Laundry[];
+  onSelectBranch?: (branchId: string) => void;
+  allTransaksiList?: Transaksi[];
+}
+
+export const LaporanView: React.FC<LaporanViewProps> = ({
+  onBack,
+  transaksiList,
+  pengeluaranList,
+  activeLaundryId,
+  laundryName,
+  currentTier,
+  onOpenUpgradeModal,
+  laundries = [],
+  onSelectBranch,
+  allTransaksiList,
+}) => {
+  const toast = useToast();
+  const currentYear = new Date().getFullYear();
+  const currentMonth = new Date().getMonth();
+
+  const limits = getLaundryLimits(currentTier);
+  const canExcel = limits.canExportExcel;
+  const canPdf = limits.canExportOfficialPdf;
+  const canGrowth = limits.canViewComparisonGrowth;
+const [showMonthPickerModal, setShowMonthPickerModal] = useState<boolean>(false);
+  const [activeTab, setActiveTab] = useState<'ringkasan' | 'komparasi' | 'cabang'>('ringkasan');
+  const [compareChartMode, setCompareChartMode] = useState<'batang' | 'tren' | 'layanan' | 'staf' | 'rasio'>('batang');
+  const [trendMetric, setTrendMetric] = useState<'omzet' | 'uangMasuk' | 'trx'>('omzet');
+  const [hoveredPointIndex, setHoveredPointIndex] = useState<number | null>(null);
+  const [selectedMonth, setSelectedMonth] = useState<number>(currentMonth); // 0-11, or -1 for All
+  const [selectedYear, setSelectedYear] = useState<number>(currentYear);
+  const [showDailyDetails, setShowDailyDetails] = useState<boolean>(false);
+  const [showPdfModal, setShowPdfModal] = useState<boolean>(false);
+  const [monthArchive, setMonthArchive] = useState<Transaksi[]>([]);
+  const [prevMonthArchive, setPrevMonthArchive] = useState<Transaksi[]>([]);
+
+  // Ambil pengaturan toko untuk nama laundry dan kop surat cetak
+  const settings = useMemo(() => {
+    return StorageService.get<SettingsData>('settings', defaultSettings);
+  }, []);
+
+  const rawLaundryName = laundryName || settings.headerStruk || settings.appTitle;
+  const effectiveLaundryName = typeof rawLaundryName === 'object' && rawLaundryName !== null
+    ? (rawLaundryName as any).namaLaundry || "Kafelas Wash"
+    : (rawLaundryName || "Kafelas Wash");
+
+  const monthNames = [
+    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'
+  ];
+
+  // Hitung periode pembanding (bulan lalu atau tahun lalu)
+  const prevPeriodInfo = useMemo(() => {
+    if (selectedMonth !== -1) {
+      const prevMonth = selectedMonth === 0 ? 11 : selectedMonth - 1;
+      const prevYear = selectedMonth === 0 ? selectedYear - 1 : selectedYear;
+      return {
+        month: prevMonth,
+        year: prevYear,
+        label: `${monthNames[prevMonth]} ${prevYear}`,
+        type: 'MoM' as const, // Month-over-Month
+      };
+    } else {
+      const prevYear = selectedYear - 1;
+      return {
+        month: -1,
+        year: prevYear,
+        label: `Tahun ${prevYear}`,
+        type: 'YoY' as const, // Year-over-Year
+      };
+    }
+  }, [selectedMonth, selectedYear]);
+
+  // Muat arsip bulan berjalan dari IndexedDB lokal (0 Reads Firestore jika tersimpan)
+  useEffect(() => {
+    let isMounted = true;
+    if (selectedMonth !== -1) {
+      FirebaseSyncService.fetchArsipBulan(activeLaundryId, selectedYear, selectedMonth)
+        .then((list) => {
+          if (isMounted) setMonthArchive(list);
+        })
+        .catch(console.warn);
+    } else {
+      // Jika "Semua Bulan (Tahunan)" dipilih, muat seluruh arsip laundry dari IndexedDB lokal
+      IndexedDbService.getAllArchive(activeLaundryId)
+        .then((list) => {
+          if (isMounted) setMonthArchive(list);
+        })
+        .catch(console.warn);
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [activeLaundryId, selectedYear, selectedMonth]);
+
+  // Muat arsip periode pembanding dari IndexedDB lokal
+  useEffect(() => {
+    let isMounted = true;
+    if (prevPeriodInfo.month !== -1) {
+      FirebaseSyncService.fetchArsipBulan(activeLaundryId, prevPeriodInfo.year, prevPeriodInfo.month)
+        .then((list) => {
+          if (isMounted) setPrevMonthArchive(list);
+        })
+        .catch(console.warn);
+    } else {
+      IndexedDbService.getAllArchive(activeLaundryId)
+        .then((list) => {
+          if (isMounted) setPrevMonthArchive(list);
+        })
+        .catch(console.warn);
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [activeLaundryId, prevPeriodInfo.year, prevPeriodInfo.month]);
+
+  // Collapsible section toggles
+  const [expandLayanan, setExpandLayanan] = useState(true);
+  const [expandStaf, setExpandStaf] = useState(true);
+  const [expandPengeluaran, setExpandPengeluaran] = useState(true);
+  const [expandPelanggan, setExpandPelanggan] = useState(true);
+  // Pelunasan order bulan lalu selalu tertutup secara bawaan (default closed) dan dibuka lewat toggle
+  const [expandPelunasanLalu, setExpandPelunasanLalu] = useState(false);
+
+  // Pastikan rincian pelunasan order bulan lalu selalu tertutup kembali setiap kali filter bulan/tahun berubah
+  useEffect(() => {
+    setExpandPelunasanLalu(false);
+    setShowAllPelunasanLalu(false);
+  }, [selectedYear, selectedMonth, activeLaundryId]);
+
+  // Toggle tampilkan semua baris (melebihi 3 baris teratas)
+  const [showAllLayanan, setShowAllLayanan] = useState<boolean>(false);
+  const [showAllStaf, setShowAllStaf] = useState<boolean>(false);
+  const [showAllPengeluaran, setShowAllPengeluaran] = useState<boolean>(false);
+  const [showAllPelanggan, setShowAllPelanggan] = useState<boolean>(false);
+  const [showAllPelunasanLalu, setShowAllPelunasanLalu] = useState<boolean>(false);
+
+  // Helper pemeriksa apakah timestamp berada dalam periode tahun & bulan yang dipilih (Waktu Lokal)
+  const isTimestampInPeriod = (timestamp: number | null | undefined, year: number, month: number): boolean => {
+    if (!timestamp) return false;
+    const d = new Date(timestamp);
+    const matchYear = d.getFullYear() === year;
+    const matchMonth = month === -1 || d.getMonth() === month;
+    return matchYear && matchMonth;
+  };
+
+  // Kumpulan seluruh transaksi outlet aktif (aktif + arsip bulan terpilih + arsip pembanding)
+  const allCombinedBranchTrx = useMemo(() => {
+    const map = new Map<string, Transaksi>();
+    transaksiList.forEach((t) => map.set(t.id, t));
+    monthArchive.forEach((t) => map.set(t.id, t));
+    prevMonthArchive.forEach((t) => map.set(t.id, t));
+    return Array.from(map.values()).filter((t) => t.laundryId === activeLaundryId);
+  }, [transaksiList, monthArchive, prevMonthArchive, activeLaundryId]);
+
+  // Perhitungan Data Komparasi Kinerja Antar-Cabang (D3.js)
+  const branchComparisonData: BranchPerformanceData[] = useMemo(() => {
+    const effectiveLaundries: Laundry[] = laundries && laundries.length > 0
+      ? laundries
+      : [{ id: activeLaundryId, ownerId: 'owner', namaLaundry: effectiveLaundryName, alamat: '', nomorTelepon: '' }];
+
+    const sourceTrx = allTransaksiList && allTransaksiList.length > 0 ? allTransaksiList : transaksiList;
+
+    const isMatchBranch = (t: Transaksi, branchId: string) => {
+      if (t.laundryId === branchId) return true;
+      if (!t.laundryId && branchId === effectiveLaundries[0]?.id) return true;
+      return false;
+    };
+
+    // Filter transaksi berdasarkan periode aktif
+    const activePeriodTrx = sourceTrx.filter((t) => isTimestampInPeriod(t.tanggalMasuk, selectedYear, selectedMonth));
+    const totalBusinessOmzet = activePeriodTrx.reduce((sum, t) => sum + (t.totalHarga || 0), 0);
+
+    return effectiveLaundries.map((lnd) => {
+      const branchTrx = activePeriodTrx.filter((t) => isMatchBranch(t, lnd.id));
+      const totalOmzet = branchTrx.reduce((sum, t) => sum + (t.totalHarga || 0), 0);
+      const totalTrx = branchTrx.length;
+      const aov = totalTrx > 0 ? Math.round(totalOmzet / totalTrx) : 0;
+      const percentageContribution = totalBusinessOmzet > 0 ? (totalOmzet / totalBusinessOmzet) * 100 : 0;
+
+      // Hitung uang masuk kasir untuk cabang ini
+      let totalUangMasuk = 0;
+      sourceTrx.filter((t) => isMatchBranch(t, lnd.id)).forEach((t) => {
+        const entries = extractTransaksiCashInEntries(t);
+        entries.forEach((entry) => {
+          if (isTimestampInPeriod(entry.timestamp, selectedYear, selectedMonth)) {
+            totalUangMasuk += entry.amount;
+          }
+        });
+      });
+
+      return {
+        branchId: lnd.id,
+        branchName: lnd.namaLaundry,
+        totalOmzet,
+        totalUangMasuk,
+        totalTrx,
+        aov,
+        percentageContribution,
+        address: lnd.alamat,
+        phone: lnd.nomorTelepon,
+      };
+    });
+  }, [laundries, activeLaundryId, effectiveLaundryName, allTransaksiList, transaksiList, selectedYear, selectedMonth]);
+
+  // Filter transaksi masuk & pengeluaran periode aktif
+  const { filteredTrx, filteredExp } = useMemo(() => {
+    const trx = allCombinedBranchTrx.filter((t) => isTimestampInPeriod(t.tanggalMasuk, selectedYear, selectedMonth));
+
+    const exp = pengeluaranList.filter((p) => {
+      if (p.laundryId !== activeLaundryId) return false;
+      return isTimestampInPeriod(p.tanggal, selectedYear, selectedMonth);
+    });
+
+    return { filteredTrx: trx, filteredExp: exp };
+  }, [allCombinedBranchTrx, pengeluaranList, activeLaundryId, selectedMonth, selectedYear]);
+
+  // Filter transaksi masuk & pengeluaran periode sebelumnya (untuk komparasi historis)
+  const { prevFilteredTrx, prevFilteredExp } = useMemo(() => {
+    const trx = allCombinedBranchTrx.filter((t) => isTimestampInPeriod(t.tanggalMasuk, prevPeriodInfo.year, prevPeriodInfo.month));
+
+    const exp = pengeluaranList.filter((p) => {
+      if (p.laundryId !== activeLaundryId) return false;
+      return isTimestampInPeriod(p.tanggal, prevPeriodInfo.year, prevPeriodInfo.month);
+    });
+
+    return { prevFilteredTrx: trx, prevFilteredExp: exp };
+  }, [allCombinedBranchTrx, pengeluaranList, activeLaundryId, prevPeriodInfo]);
+
+  // Agregat Metrik Periode Berjalan (Arus Kas Riil & Pelunasan Lintas Bulan)
+  const summary = useMemo(() => {
+    let totalOmzet = 0;
+    let countLunas = 0;
+    let countBelumLunas = 0;
+    let totalWeight = 0;
+    let totalPiutang = 0;
+
+    const serviceMap: Record<string, number> = {};
+    const customerMap: Record<string, number> = {};
+    const staffMap: Record<string, StaffPerformanceSummary> = {};
+
+    // 1. Data Pesanan Cuci Kendaraan Masuk pada Periode Ini
+    const endOfPeriod = selectedMonth === -1
+      ? new Date(selectedYear, 11, 31, 23, 59, 59, 999).getTime()
+      : new Date(selectedYear, selectedMonth + 1, 0, 23, 59, 59, 999).getTime();
+
+    filteredTrx.forEach((t) => {
+      totalOmzet += t.totalHarga || 0;
+      const waktuPelunasan = t.tanggalPelunasan || t.tanggalPengambilan;
+      const isLunasInPeriod = t.statusPembayaran === 'Lunas' && (!waktuPelunasan || waktuPelunasan <= endOfPeriod);
+
+      if (isLunasInPeriod) {
+        countLunas++;
+      } else {
+        countBelumLunas++;
+        const bayarAwal = Math.min(t.totalHarga || 0, t.jumlahDp || 0);
+        const sisa = Math.max(0, (t.totalHarga || 0) - bayarAwal);
+        totalPiutang += sisa;
+      }
+
+      (t.items || []).forEach((it) => {
+        if (!it) return;
+        totalWeight += it.berat || 0;
+        serviceMap[it.namaLayanan] = (serviceMap[it.namaLayanan] || 0) + (it.berat || 0);
+      });
+
+      if (t.namaPelanggan) {
+        customerMap[t.namaPelanggan] = (customerMap[t.namaPelanggan] || 0) + 1;
+      }
+
+      // Evaluasi Kinerja Staf / Kasir
+      const rawStaff = t.dikerjakanOleh && t.dikerjakanOleh.trim()
+        ? t.dikerjakanOleh.trim()
+        : 'Kasir / Belum Ditugaskan';
+
+      if (!staffMap[rawStaff]) {
+        staffMap[rawStaff] = {
+          nama: rawStaff,
+          totalTrx: 0,
+          totalKg: 0,
+          totalOmzet: 0,
+          countSelesai: 0,
+          countProses: 0,
+          countDiterima: 0,
+        };
+      }
+
+      staffMap[rawStaff].totalTrx += 1;
+      staffMap[rawStaff].totalOmzet += t.totalHarga || 0;
+      (t.items || []).forEach((it) => {
+        if (!it) return;
+        staffMap[rawStaff].totalKg += it.berat || 0;
+      });
+
+      if (t.status === 'Selesai' || t.status === 'Diambil') {
+        staffMap[rawStaff].countSelesai += 1;
+      } else if (t.status === 'Proses') {
+        staffMap[rawStaff].countProses += 1;
+      } else {
+        staffMap[rawStaff].countDiterima += 1;
+      }
+    });
+
+    // 2. Data Arus Kas Masuk Kasir Riil (Uang Masuk DP + Pelunasan yang diterima di bulan ini)
+    let totalUangMasuk = 0;
+    let uangMasukOrderBulanIni = 0;
+    let uangPelunasanBulanLalu = 0;
+    const dailyMap: Record<string, { trxCount: number; masuk: number; keluar: number }> = {};
+    const pelunasanBulanLaluList: {
+      trx: Transaksi;
+      pelunasan: number;
+      waktuPelunasan: number;
+    }[] = [];
+
+    // Catat jumlah order masuk pada hari order masuk (Ganti hari lokal: 00:00 tengah malam)
+    filteredTrx.forEach((t) => {
+      const dayKey = formatLocalDateKey(t.tanggalMasuk);
+      if (!dailyMap[dayKey]) dailyMap[dayKey] = { trxCount: 0, masuk: 0, keluar: 0 };
+      dailyMap[dayKey].trxCount++;
+    });
+
+    // Evaluasi seluruh aliran uang masuk riil dari SEMUA transaksi
+    allCombinedBranchTrx.forEach((t) => {
+      const entries = extractTransaksiCashInEntries(t);
+      entries.forEach((entry) => {
+        if (isTimestampInPeriod(entry.timestamp, selectedYear, selectedMonth)) {
+          totalUangMasuk += entry.amount;
+
+          // Apakah uang ini berasal dari order yang masuk di bulan ini atau bulan sebelumnya?
+          const orderMasukDiBulanIni = isTimestampInPeriod(t.tanggalMasuk, selectedYear, selectedMonth);
+          if (orderMasukDiBulanIni) {
+            uangMasukOrderBulanIni += entry.amount;
+          } else {
+            uangPelunasanBulanLalu += entry.amount;
+            if (entry.type === 'pelunasan') {
+              pelunasanBulanLaluList.push({
+                trx: t,
+                pelunasan: entry.amount,
+                waktuPelunasan: entry.timestamp,
+              });
+            }
+          }
+
+          // Catat pemasukan kas pada hari uang tersebut fisik diterima di kasir
+          const dayKey = formatLocalDateKey(entry.timestamp);
+          if (!dailyMap[dayKey]) dailyMap[dayKey] = { trxCount: 0, masuk: 0, keluar: 0 };
+          dailyMap[dayKey].masuk += entry.amount;
+        }
+      });
+    });
+
+    // 3. Evaluasi Pengeluaran Operasional pada Periode Ini
+    const expenseCategoryMap: Record<string, number> = {};
+    let totalPengeluaran = 0;
+    filteredExp.forEach((p) => {
+      totalPengeluaran += p.jumlah;
+      expenseCategoryMap[p.keterangan || 'Operasional'] =
+        (expenseCategoryMap[p.keterangan || 'Operasional'] || 0) + p.jumlah;
+
+      const dayKey = formatLocalDateKey(p.tanggal);
+      if (!dailyMap[dayKey]) dailyMap[dayKey] = { trxCount: 0, masuk: 0, keluar: 0 };
+      dailyMap[dayKey].keluar += p.jumlah;
+    });
+
+    const labaBersih = totalUangMasuk - totalPengeluaran;
+
+    const staffList = Object.values(staffMap).sort((a, b) => {
+      if (b.totalTrx !== a.totalTrx) return b.totalTrx - a.totalTrx;
+      return b.totalKg - a.totalKg;
+    });
+
+    return {
+      totalOmzet,
+      totalUangMasuk,
+      totalUangMasukTrx: totalUangMasuk, // Seluruh uang kasir laundry yang diterima
+      uangMasukOrderBulanIni,
+      uangPelunasanBulanLalu,
+      totalPiutang,
+      totalPengeluaran,
+      labaBersih,
+      totalTrx: filteredTrx.length,
+      totalWeight,
+      countLunas,
+      countBelumLunas,
+      serviceMap,
+      serviceList: Object.entries(serviceMap).sort((a, b) => b[1] - a[1]),
+      staffList,
+      customerList: Object.entries(customerMap).sort((a, b) => b[1] - a[1]),
+      expenseList: Object.entries(expenseCategoryMap).sort((a, b) => b[1] - a[1]),
+      dailyRows: Object.entries(dailyMap).sort((a, b) => a[0].localeCompare(b[0])),
+      pelunasanBulanLaluList: pelunasanBulanLaluList.sort((a, b) => b.waktuPelunasan - a.waktuPelunasan),
+    };
+  }, [filteredTrx, filteredExp, allCombinedBranchTrx, selectedMonth, selectedYear]);
+
+  // Agregat Metrik Periode Pembanding (Periode Lalu)
+  const prevSummary = useMemo(() => {
+    let totalOmzet = 0;
+    let totalWeight = 0;
+
+    prevFilteredTrx.forEach((t) => {
+      totalOmzet += t.totalHarga || 0;
+      (t.items || []).forEach((it) => {
+        totalWeight += it.berat || 0;
+      });
+    });
+
+    // Hitung arus kas masuk riil periode pembanding
+    let totalUangMasuk = 0;
+    allCombinedBranchTrx.forEach((t) => {
+      const entries = extractTransaksiCashInEntries(t);
+      entries.forEach((entry) => {
+        if (isTimestampInPeriod(entry.timestamp, prevPeriodInfo.year, prevPeriodInfo.month)) {
+          totalUangMasuk += entry.amount;
+        }
+      });
+    });
+
+    const totalPengeluaran = prevFilteredExp.reduce((sum, p) => sum + p.jumlah, 0);
+    const labaBersih = totalUangMasuk - totalPengeluaran;
+
+    // Service map periode lalu
+    const serviceMap: Record<string, number> = {};
+    prevFilteredTrx.forEach((t) => {
+      (t.items || []).forEach((it) => {
+        if (!it) return;
+        serviceMap[it.namaLayanan] = (serviceMap[it.namaLayanan] || 0) + (it.berat || 0);
+      });
+    });
+
+    return {
+      totalOmzet,
+      totalUangMasuk,
+      totalPengeluaran,
+      labaBersih,
+      totalTrx: prevFilteredTrx.length,
+      totalWeight,
+      serviceMap,
+    };
+  }, [prevFilteredTrx, prevFilteredExp, allCombinedBranchTrx, prevPeriodInfo]);
+
+  // Kalkulasi Pertumbuhan Komparatif (Growth Rates)
+  const comparativeAnalytics = useMemo(() => {
+    const calcGrowth = (current: number, previous: number) => {
+      if (previous === 0) return current > 0 ? 100 : 0;
+      return ((current - previous) / Math.abs(previous)) * 100;
+    };
+
+    const omzetDiff = summary.totalOmzet - prevSummary.totalOmzet;
+    const omzetGrowth = calcGrowth(summary.totalOmzet, prevSummary.totalOmzet);
+
+    const uangMasukDiff = summary.totalUangMasuk - prevSummary.totalUangMasuk;
+    const uangMasukGrowth = calcGrowth(summary.totalUangMasuk, prevSummary.totalUangMasuk);
+
+    const expDiff = summary.totalPengeluaran - prevSummary.totalPengeluaran;
+    const expGrowth = calcGrowth(summary.totalPengeluaran, prevSummary.totalPengeluaran);
+
+    const labaDiff = summary.labaBersih - prevSummary.labaBersih;
+    const labaGrowth = calcGrowth(summary.labaBersih, prevSummary.labaBersih);
+
+    const trxDiff = summary.totalTrx - prevSummary.totalTrx;
+    const trxGrowth = calcGrowth(summary.totalTrx, prevSummary.totalTrx);
+
+    const weightDiff = summary.totalWeight - prevSummary.totalWeight;
+    const weightGrowth = calcGrowth(summary.totalWeight, prevSummary.totalWeight);
+
+    return {
+      omzetDiff,
+      omzetGrowth,
+      uangMasukDiff,
+      uangMasukGrowth,
+      expDiff,
+      expGrowth,
+      labaDiff,
+      labaGrowth,
+      trxDiff,
+      trxGrowth,
+      weightDiff,
+      weightGrowth,
+    };
+  }, [summary, prevSummary]);
+
+  // Data Perbandingan Tren Kurva SVG (Harian jika per bulan, atau Bulanan jika per tahun)
+  const trendComparisonData = useMemo(() => {
+    const isYearly = selectedMonth === -1;
+    const numPoints = isYearly ? 12 : new Date(selectedYear, selectedMonth + 1, 0).getDate();
+
+    const currentPoints: { label: string; fullLabel: string; omzet: number; uangMasuk: number; trx: number }[] = [];
+    const prevPoints: { label: string; fullLabel: string; omzet: number; uangMasuk: number; trx: number }[] = [];
+
+    for (let i = 0; i < numPoints; i++) {
+      const label = isYearly ? monthNames[i].slice(0, 3) : `${i + 1}`;
+      const fullLabel = isYearly
+        ? `${monthNames[i]} ${selectedYear}`
+        : `${i + 1} ${monthNames[selectedMonth]} ${selectedYear}`;
+      currentPoints.push({ label, fullLabel, omzet: 0, uangMasuk: 0, trx: 0 });
+
+      const prevFullLabel = isYearly
+        ? `${monthNames[i]} ${prevPeriodInfo.year}`
+        : `${i + 1} ${prevPeriodInfo.month !== -1 ? monthNames[prevPeriodInfo.month] : ''} ${prevPeriodInfo.year}`;
+      prevPoints.push({ label, fullLabel: prevFullLabel, omzet: 0, uangMasuk: 0, trx: 0 });
+    }
+
+    // 1. Omzet dan order masuk periode berjalan
+    filteredTrx.forEach((t) => {
+      const d = new Date(t.tanggalMasuk);
+      const idx = isYearly ? d.getMonth() : d.getDate() - 1;
+      if (idx >= 0 && idx < numPoints) {
+        currentPoints[idx].omzet += t.totalHarga || 0;
+        currentPoints[idx].trx += 1;
+      }
+    });
+
+    // 2. Arus kas masuk riil periode berjalan
+    allCombinedBranchTrx.forEach((t) => {
+      const entries = extractTransaksiCashInEntries(t);
+      entries.forEach((entry) => {
+        if (isTimestampInPeriod(entry.timestamp, selectedYear, selectedMonth)) {
+          const d = new Date(entry.timestamp);
+          const idx = isYearly ? d.getMonth() : d.getDate() - 1;
+          if (idx >= 0 && idx < numPoints) {
+            currentPoints[idx].uangMasuk += entry.amount;
+          }
+        }
+      });
+    });
+
+    // 3. Omzet dan order masuk periode pembanding
+    prevFilteredTrx.forEach((t) => {
+      const d = new Date(t.tanggalMasuk);
+      const idx = isYearly ? d.getMonth() : d.getDate() - 1;
+      if (idx >= 0 && idx < numPoints) {
+        prevPoints[idx].omzet += t.totalHarga || 0;
+        prevPoints[idx].trx += 1;
+      }
+    });
+
+    // 4. Arus kas masuk riil periode pembanding
+    allCombinedBranchTrx.forEach((t) => {
+      const entries = extractTransaksiCashInEntries(t);
+      entries.forEach((entry) => {
+        if (isTimestampInPeriod(entry.timestamp, prevPeriodInfo.year, prevPeriodInfo.month)) {
+          const d = new Date(entry.timestamp);
+          const idx = isYearly ? d.getMonth() : d.getDate() - 1;
+          if (idx >= 0 && idx < numPoints) {
+            prevPoints[idx].uangMasuk += entry.amount;
+          }
+        }
+      });
+    });
+
+    return { isYearly, numPoints, currentPoints, prevPoints };
+  }, [filteredTrx, prevFilteredTrx, allCombinedBranchTrx, selectedMonth, selectedYear, prevPeriodInfo, monthNames]);
+
+  // Data Perbandingan Kinerja Seluruh Layanan (Kg / Unit)
+  const serviceComparisonList = useMemo(() => {
+    const curMap = summary.serviceMap || {};
+    const prvMap = prevSummary.serviceMap || {};
+    const allNames = Array.from(new Set([...Object.keys(curMap), ...Object.keys(prvMap)]));
+
+    return allNames
+      .map((name) => {
+        const currentVal = curMap[name] || 0;
+        const prevVal = prvMap[name] || 0;
+        const diff = currentVal - prevVal;
+        const growth = prevVal === 0 ? (currentVal > 0 ? 100 : 0) : ((currentVal - prevVal) / prevVal) * 100;
+        return { name, currentVal, prevVal, diff, growth };
+      })
+      .sort((a, b) => b.currentVal - a.currentVal);
+  }, [summary.serviceMap, prevSummary.serviceMap]);
+
+  // Metrik Rasio Eksekutif & Skor Kesehatan Bisnis
+  const executiveMetrics = useMemo(() => {
+    const currentMargin = summary.totalOmzet > 0 ? (summary.labaBersih / summary.totalOmzet) * 100 : 0;
+    const prevMargin = prevSummary.totalOmzet > 0 ? (prevSummary.labaBersih / prevSummary.totalOmzet) * 100 : 0;
+    const marginDiff = currentMargin - prevMargin;
+
+    const currentAov = summary.totalTrx > 0 ? summary.totalOmzet / summary.totalTrx : 0;
+    const prevAov = prevSummary.totalTrx > 0 ? prevSummary.totalOmzet / prevSummary.totalTrx : 0;
+    const aovDiff = currentAov - prevAov;
+
+    const currentCostRatio = summary.totalOmzet > 0 ? (summary.totalPengeluaran / summary.totalOmzet) * 100 : 0;
+    const prevCostRatio = prevSummary.totalOmzet > 0 ? (prevSummary.totalPengeluaran / prevSummary.totalOmzet) * 100 : 0;
+
+    let score = 50;
+    if (currentMargin >= 40) score += 20;
+    else if (currentMargin >= 20) score += 10;
+    else if (currentMargin < 0) score -= 25;
+
+    if (comparativeAnalytics.omzetGrowth > 10) score += 15;
+    else if (comparativeAnalytics.omzetGrowth > 0) score += 10;
+    else if (comparativeAnalytics.omzetGrowth < -10) score -= 15;
+
+    if (currentCostRatio <= 50) score += 15;
+    else if (currentCostRatio > 75) score -= 15;
+
+    const healthScore = Math.max(10, Math.min(100, Math.round(score)));
+
+    let healthLabel = 'Sangat Sehat & Menguntungkan';
+    let healthColor = 'text-emerald-700 bg-emerald-50 border-emerald-200';
+    if (healthScore < 40) {
+      healthLabel = 'Perlu Efisiensi & Waspada Biaya';
+      healthColor = 'text-red-700 bg-red-50 border-red-200';
+    } else if (healthScore < 70) {
+      healthLabel = 'Stabil & Bertumbuh Wajar';
+      healthColor = 'text-amber-700 bg-amber-50 border-amber-200';
+    }
+
+    return {
+      currentMargin,
+      prevMargin,
+      marginDiff,
+      currentAov,
+      prevAov,
+      aovDiff,
+      currentCostRatio,
+      prevCostRatio,
+      healthScore,
+      healthLabel,
+      healthColor,
+    };
+  }, [summary, prevSummary, comparativeAnalytics]);
+
+  const currentPeriodeLabel = `${selectedMonth === -1 ? 'Semua Bulan' : monthNames[selectedMonth]} ${selectedYear}`;
+
+  // Handler Ekspor Excel (.xlsx) — dimuat dinamis saat tombol diklik
+  const handleExportExcel = async () => {
+    if (!canExcel) {
+      toast.warning('Fitur ekspor Excel (.xlsx) hanya untuk Paket Premium.');
+      return;
+    }
+
+    try {
+      const exportPayload: LaporanSummaryExportData = {
+        laundryName: effectiveLaundryName,
+        periodeLabel: currentPeriodeLabel,
+        totalOmzet: summary.totalOmzet,
+        totalUangMasuk: summary.totalUangMasuk,
+        totalUangMasukTrx: summary.totalUangMasukTrx,
+        totalPengeluaran: summary.totalPengeluaran,
+        labaBersih: summary.labaBersih,
+        totalTrx: summary.totalTrx,
+        countLunas: summary.countLunas,
+        countBelumLunas: summary.countBelumLunas,
+        uangMasukOrderBulanIni: summary.uangMasukOrderBulanIni,
+        uangPelunasanBulanLalu: summary.uangPelunasanBulanLalu,
+        totalPiutang: summary.totalPiutang,
+        pelunasanBulanLaluList: summary.pelunasanBulanLaluList,
+        comparison: {
+          prevPeriodeLabel: prevPeriodInfo.label,
+          prevOmzet: prevSummary.totalOmzet,
+          prevUangMasuk: prevSummary.totalUangMasuk,
+          prevPengeluaran: prevSummary.totalPengeluaran,
+          prevLabaBersih: prevSummary.labaBersih,
+          prevTrxCount: prevSummary.totalTrx,
+          omzetGrowth: comparativeAnalytics.omzetGrowth,
+          labaGrowth: comparativeAnalytics.labaGrowth,
+        },
+        serviceList: summary.serviceList,
+        customerList: summary.customerList,
+        expenseList: summary.expenseList,
+        staffList: summary.staffList,
+        dailyRows: summary.dailyRows,
+      };
+
+      const { exportLaporanToExcel } = await import('../utils/excelExport');
+      exportLaporanToExcel(exportPayload, filteredTrx, filteredExp);
+      toast.success('Berkas Excel (.xlsx) berhasil diunduh!');
+    } catch (err) {
+      console.error('Export Excel error:', err);
+      toast.error('Gagal mengekspor berkas Excel. Coba lagi.');
+    }
+  };
+
+  // Payload data lengkap untuk pembuatan dokumen PDF resmi
+  const pdfPayload: LaporanPdfData = useMemo(() => ({
+    laundryName: effectiveLaundryName,
+    laundryAddress: settings.address || 'Bandung',
+    laundryPhone: settings.phoneNumber || '-',
+    periodeLabel: currentPeriodeLabel,
+    totalOmzet: summary.totalOmzet,
+    totalUangMasuk: summary.totalUangMasuk,
+    totalUangMasukTrx: summary.totalUangMasukTrx,
+    totalPengeluaran: summary.totalPengeluaran,
+    labaBersih: summary.labaBersih,
+    totalTrx: summary.totalTrx,
+    totalWeight: summary.totalWeight,
+    countLunas: summary.countLunas,
+    countBelumLunas: summary.countBelumLunas,
+    uangMasukOrderBulanIni: summary.uangMasukOrderBulanIni,
+    uangPelunasanBulanLalu: summary.uangPelunasanBulanLalu,
+    totalPiutang: summary.totalPiutang,
+    comparison: {
+      prevPeriodeLabel: prevPeriodInfo.label,
+      prevOmzet: prevSummary.totalOmzet,
+      prevUangMasuk: prevSummary.totalUangMasuk,
+      prevPengeluaran: prevSummary.totalPengeluaran,
+      prevLabaBersih: prevSummary.labaBersih,
+      prevTrxCount: prevSummary.totalTrx,
+      omzetGrowth: comparativeAnalytics.omzetGrowth,
+      labaGrowth: comparativeAnalytics.labaGrowth,
+      expGrowth: comparativeAnalytics.expGrowth,
+      trxGrowth: comparativeAnalytics.trxGrowth,
+    },
+    serviceList: summary.serviceList,
+    expenseList: summary.expenseList,
+    staffList: summary.staffList,
+  }), [
+    effectiveLaundryName,
+    settings.address,
+    settings.phoneNumber,
+    currentPeriodeLabel,
+    summary,
+    prevPeriodInfo.label,
+    prevSummary,
+    comparativeAnalytics,
+  ]);
+
+  // 1-Click Direct Download PDF File — dimuat dinamis saat tombol diklik
+  const handleDownloadPDF = async () => {
+    if (!canPdf) {
+      toast.warning('Fitur cetak dan unduh dokumen laporan resmi PDF hanya untuk Paket Premium.');
+      return;
+    }
+
+    try {
+      const { generateLaporanPdf } = await import('../utils/pdfExport');
+      const fileName = generateLaporanPdf(pdfPayload);
+      toast.success(`Berkas PDF ${fileName} berhasil diunduh ke HP/PC!`);
+    } catch (err) {
+      console.error('Download PDF error:', err);
+      toast.error('Gagal mengunduh PDF. Membuka pratinjau...');
+      setShowPdfModal(true);
+    }
+  };
+
+  // Open Preview & Print Modal
+  const handleOpenPdfModal = () => {
+    if (!canPdf) {
+      toast.warning('Fitur cetak dokumen laporan resmi PDF hanya untuk Paket Premium.');
+      return;
+    }
+
+    setShowPdfModal(true);
+  };
+
+  return (
+    <div className="flex flex-col max-h-screen bg-slate-100 text-slate-800 pb-1">
+      {/* Top Header */}
+<header className="bg-[#800000] text-white shadow-lg sticky top-0 z-30 px-4 py-3 pb-2 h-16 flex items-center justify-between no-print">
+        <div className="flex items-center gap-3 min-w-0">
+          <button
+            onClick={onBack}
+            className="p-2 -ml-1 rounded-xl hover:bg-white/10 active:scale-95 transition cursor-pointer shrink-0"
+            title="Kembali"
+          >
+            <ArrowLeft className="w-5 h-5 text-white" />
+          </button>
+          <div className="min-w-0">
+            <h1 className="font-black text-base tracking-tight leading-tight">Laporan Keuangan</h1>
+            <p className="text-[11px] text-white/80 font-medium truncate">
+              Periode: {currentPeriodeLabel}
+            </p>
+          </div>
+        </div>
+
+  {/* Tombol Ekspor Excel, Cetak PDF & Pratinjau (Hanya Ikon, Tanpa Background) */}
+<div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+  {/* Tombol Excel */}
+  <button
+    type="button"
+    onClick={handleExportExcel}
+    className="p-2 rounded-xl hover:bg-slate-100 text-slate-700 transition active:scale-95 cursor-pointer"
+    title={!canExcel ? 'Terkunci di Paket Newcomer (Klik untuk upgrade)' : 'Unduh Spreadsheet Excel (.xlsx)'}
+  >
+    {!canExcel ? (
+      <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+    ) : (
+      <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+    )}
+  </button>
+
+  {/* Tombol PDF */}
+  <button
+    type="button"
+    onClick={handleDownloadPDF}
+    className="p-2 rounded-xl hover:bg-slate-100 text-slate-700 transition active:scale-95 cursor-pointer"
+    title={!canPdf ? 'Terkunci di Paket Newcomer (Klik untuk upgrade ke Premium)' : 'Unduh Berkas PDF (.pdf) Langsung'}
+  >
+    {!canPdf ? (
+      <Download className="w-4 h-4 text-amber-500" />
+    ) : (
+      <Download className="w-4 h-4 text-amber-500" />
+    )}
+  </button>
+
+  {/* Tombol Cetak / Pratinjau */}
+  <button
+    type="button"
+    onClick={handleOpenPdfModal}
+    className="p-2 rounded-xl hover:bg-slate-100 text-slate-700 transition active:scale-95 cursor-pointer"
+    title={!canPdf ? 'Terkunci di Paket Newcomer (Klik untuk upgrade)' : 'Pratinjau Dokumen & Cetak Kertas'}
+  >
+    {!canPdf ? (
+      <Printer className="w-4 h-4 text-amber-600" />
+    ) : (
+      <Printer className="w-4 h-4 text-amber-600" />
+    )}
+  </button>
+</div>
+      </header>
+
+    <div className="bg-white border-b border-slate-200 px-4 md:px-6 py-3 shadow-2xs no-print">
+      <div className="max-w-xl md:max-w-5xl mx-auto w-full space-y-3">
+        {/* Dropdown Pemilihan Periode (Custom Modern Selector) */}
+        <div className="flex items-center justify-between gap-2.5">
+          {/* Tombol Pemilih Bulan Interaktif */}
+          <button
+            type="button"
+            onClick={() => setShowMonthPickerModal(true)}
+            className="flex-1 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-slate-50 hover:bg-rose-50/60 active:scale-98 transition flex items-center justify-between gap-2 text-left cursor-pointer shadow-2xs group"
+          >
+            <div className="flex items-center gap-2.5 min-w-0">
+           
+              <div className="min-w-0">
+           
+                <span className="text-xs font-black text-slate-900 truncate block">
+                  {selectedMonth === -1 ? 'Semua Bulan (Tahunan)' : monthNames[selectedMonth]}
+                </span>
+              </div>
+            </div>
+            <ChevronDown className="w-4 h-4 text-slate-400 group-hover:text-[#800000] transition-transform" />
+          </button>
+
+          {/* Selector Tahun */}
+          <div className="relative shrink-0">
+            <select
+              value={selectedYear}
+              onChange={(e) => setSelectedYear(parseInt(e.target.value, 10))}
+              className="pl-3 pr-8 py-2.5 rounded-xl border border-slate-200 text-xs font-black bg-slate-50 text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#800000] cursor-pointer appearance-none shadow-2xs"
+            >
+              {[currentYear - 2, currentYear - 1, currentYear, currentYear + 1].map((y) => (
+                <option key={y} value={y}>
+                  {y}
+                </option>
+              ))}
+            </select>
+            <ChevronDown className="w-3.5 h-3.5 text-slate-400 absolute right-2.5 top-3.5 pointer-events-none" />
+          </div>
+        </div>
+
+        {/* Tab Switcher: Ringkasan vs Analisis Komparasi vs Performa Cabang */}
+        <div className="grid grid-cols-3 p-1 bg-slate-100 rounded-xl text-xs font-bold border border-slate-200/60">
+          <button
+            type="button"
+            onClick={() => setActiveTab('ringkasan')}
+            className={`py-1 px-0 sm:px-3 rounded-lg flex items-center justify-center gap-1.5 transition cursor-pointer ${
+              activeTab === 'ringkasan'
+                ? 'bg-white text-slate-900 shadow-xs font-black'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <span className="truncate">📊 Ringkasan</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              if (!canGrowth) {
+                toast.warning('Fitur analisis komparasi pertumbuhan (MoM & YoY) hanya untuk Paket Premium.');
+                return;
+              }
+              setActiveTab('komparasi');
+            }}
+            className={`py-2 px-1.5 sm:px-3 rounded-lg flex items-center justify-center gap-1.5 transition cursor-pointer ${
+              activeTab === 'komparasi'
+                ? 'bg-[#800000] text-white shadow-xs font-black'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            {!canGrowth ? (
+              <TrendingUp className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            ) : (
+              <TrendingUp className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            )}
+            <span className="truncate">Komparasi {!canGrowth ? '(Premium)' : ''}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('cabang')}
+            className={`py-2 px-1.5 sm:px-3 rounded-lg flex items-center justify-center gap-1.5 transition cursor-pointer ${
+              activeTab === 'cabang'
+                ? 'bg-[#800000] text-white shadow-xs font-black'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Building2 className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span className="truncate">Performa Cabang</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Modal / Grid Popover Pemilihan Bulan Interaktif */}
+      {showMonthPickerModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4 animate-fade-in"
+          onClick={() => setShowMonthPickerModal(false)}
+        >
+          <div
+            className="w-full max-w-sm bg-white border border-slate-200 rounded-2xl shadow-2xl p-4 space-y-3.5 text-slate-800"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header Modal */}
+            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+              <div className="flex items-center gap-2">
+                <Calendar className="w-4 h-4 text-[#800000]" />
+                <h3 className="font-extrabold text-xs text-slate-900 uppercase tracking-wider">
+                  Pilih Bulan Laporan ({selectedYear})
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowMonthPickerModal(false)}
+                className="p-1 rounded-lg text-slate-400 hover:bg-slate-100 transition cursor-pointer"
+              >
+              </button>
+            </div>
+
+            {/* Opsi Tahunan (Semua Bulan) */}
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedMonth(-1);
+                setShowMonthPickerModal(false);
+              }}
+              className={`w-full py-2.5 px-3 rounded-xl font-bold text-xs flex items-center justify-between transition cursor-pointer ${
+                selectedMonth === -1
+                  ? 'bg-[#800000] text-white shadow-xs font-black'
+                  : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200/80'
+              }`}
+            >
+              <span>🗓️ Rekapitulasi Semua Bulan (Tahunan)</span>
+              {selectedMonth === -1 && <CheckCircle2 className="w-4 h-4 text-amber-300" />}
+            </button>
+
+            {/* Grid 12 Bulan (3 Kolom x 4 Baris) */}
+            <div className="grid grid-cols-3 gap-2 pt-1">
+              {monthNames.map((m, idx) => {
+                const isSelected = selectedMonth === idx;
+                const isCurrentMonth = idx === currentMonth && selectedYear === currentYear;
+
+                return (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => {
+                      setSelectedMonth(idx);
+                      setShowMonthPickerModal(false);
+                    }}
+                    className={`py-2.5 px-2 rounded-xl text-xs font-bold transition flex flex-col items-center justify-center relative cursor-pointer ${
+                      isSelected
+                        ? 'bg-[#800000] text-white shadow-md font-black scale-102'
+                        : 'bg-slate-50 hover:bg-rose-50 text-slate-700 hover:text-[#800000] border border-slate-200/70'
+                    }`}
+                  >
+                    <span>{m}</span>
+                    {isCurrentMonth && !isSelected && (
+                      <span className="text-[9px] text-emerald-600 font-extrabold mt-0.5">
+                        • Bulan Ini
+                      </span>
+                    )}
+                    {isSelected && (
+                      <span className="text-[9px] text-amber-300 font-bold mt-0.5">
+                        ✓ Terpilih
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+
+      <main className="flex-1 p-2 md:p-6 space-y-1 md:space-y-1 overflow-y-auto max-w-xl md:max-w-5xl  w-full no-print">
+        {/* ======================================================== */}
+        {/* TAB 1: RINGKASAN KEUANGAN                                */}
+        {/* ======================================================== */}
+        {activeTab === 'ringkasan' && (
+          <>
+            {/* Data Keuangan Card */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-3 shadow-2xs space-y-1">
+              <div className="flex justify-between items-start">
+                <div>
+                  <h2 className="text-xs font-extrabold text-[#800000] uppercase tracking-wider">
+                    Data Keuangan ({currentPeriodeLabel})
+                  </h2>
+              
+                </div>
+                <span className="text-[11px] text-slate-500 font-medium">
+                  {summary.totalTrx} Transaksi
+                </span>
+              </div>
+
+              <div className="space-y-2 text-xs divide-y divide-slate-100">
+                <div className="flex justify-between items-center pt-1">
+                  <span className="text-slate-600">Total Pendapatan (Omzet)</span>
+                  <span className="font-extrabold text-slate-900 tabular-nums">
+                    {formatRupiah(summary.totalOmzet).replace('Rp ', '').replace('Rp', '')}
+                  </span>
+                </div>
+
+                <div className="flex justify-between items-center pt-2">
+                  <span className="text-slate-700 font-bold">Total Uang Masuk Kasir</span>
+                  <span className="font-black text-emerald-700 tabular-nums">
+                    {formatRupiah(summary.totalUangMasuk).replace('Rp ', '').replace('Rp', '')}
+                  </span>
+                </div>
+
+                <div className="flex justify-between items-center  pl-3 text-slate-500 text-[11px]">
+                  <span>• Dari Order Masuk Periode Ini</span>
+                  <span className="tabular-nums font-medium">{formatRupiah(summary.uangMasukOrderBulanIni).replace('Rp ', '').replace('Rp', '')}</span>
+                </div>
+
+                {summary.uangPelunasanBulanLalu > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setExpandPelunasanLalu(!expandPelunasanLalu)}
+                    className="w-full flex justify-between items-center  pl-3 text-emerald-800 text-[11px]  transition cursor-pointer text-left group"
+                    title={expandPelunasanLalu ? "Tutup rincian pelunasan bulan lalu" : "Buka rincian pelunasan bulan lalu"}
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <span>• Pelunasan Order Bulan Lalu ({summary.pelunasanBulanLaluList.length} Nota)</span>
+                      <span className="text-[10px] bg-emerald-100 group-hover:bg-emerald-200 text-emerald-800 px-1.5 py-0.5 rounded border border-emerald-200/80 font-bold transition flex items-center gap-0.5">
+                        {expandPelunasanLalu ? '' : ''}
+                        {expandPelunasanLalu ? <ChevronUp className="w-3 h-3 inline" /> : <ChevronDown className="w-3 h-3 inline" />}
+                      </span>
+                    </span>
+                    <span className="tabular-nums font-bold text-emerald-700">+{formatRupiah(summary.uangPelunasanBulanLalu).replace('Rp ', '').replace('Rp', '')}</span>
+                  </button>
+                )}
+
+                {summary.totalPiutang > 0 && (
+                  <div className="flex justify-between items-center pl-3 text-amber-700 text-[11px]">
+                    <span>• Piutang Berjalan (Belum Lunas)</span>
+                    <span className="tabular-nums font-medium">{formatRupiah(summary.totalPiutang).replace('Rp ', '').replace('Rp', '')}</span>
+                  </div>
+                )}
+
+                <div className="flex justify-between items-center pt-2">
+                  <span className="text-slate-700 font-bold">Total Pengeluaran Operasional</span>
+                  <span className="font-black text-red-600 tabular-nums">
+                    {formatRupiah(summary.totalPengeluaran).replace('Rp ', '').replace('Rp', '')}
+                  </span>
+                </div>
+
+                <div className="flex justify-between items-center pt-2.5 bg-emerald-50/70 p-2.5 rounded-xl text-sm font-black border border-emerald-100">
+                  <span className="text-slate-800">Laba Bersih</span>
+                  <span
+                    className={`tabular-nums ${
+                      summary.labaBersih >= 0 ? 'text-emerald-700' : 'text-red-700'
+                    }`}
+                  >
+                    {formatRupiah(summary.labaBersih)}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Kartu Khusus: Pelunasan Order Bulan Lalu yang Masuk Kas di Bulan Ini */}
+            {summary.pelunasanBulanLaluList.length > 0 && (
+              <div className="bg-white rounded-2xl border border-emerald-200 p-2 sm:p-4 shadow-2xs space-y-1">
+                <button
+                  type="button"
+                  onClick={() => setExpandPelunasanLalu(!expandPelunasanLalu)}
+                  className="w-full flex justify-between items-center cursor-pointer select-none text-left p-1 rounded-xl hover:bg-emerald-100/60 transition-colors"
+                  aria-expanded={expandPelunasanLalu}
+                >
+                  <div className="flex items-center gap-2.5">
+               
+                    <div>
+                      <div className="flex items-center gap-1">
+                        <h2 className="text-xs font-extrabold text-emerald-950  tracking-wider">
+                          Pelunasan Bulan Lalu
+                        </h2>
+                        <span className="text-[10px] font-bold bg-emerald-200/80 text-emerald-900 px-1  rounded-full">
+                          {summary.pelunasanBulanLaluList.length} 
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-emerald-700 font-medium">
+                        {expandPelunasanLalu ? 'Klik untuk menutup rincian nota' : 'Klik untuk membuka rincian nota'}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-xs sm:text-sm font-black text-emerald-700 tabular-nums">
+                      +{formatRupiah(summary.uangPelunasanBulanLalu)}
+                    </span>
+                    <div className="p-1.5 rounded-lg bg-emerald-200/60 text-emerald-900 hover:bg-emerald-200 transition-colors">
+                      {expandPelunasanLalu ? (
+                        <ChevronUp className="w-4 h-4" />
+                      ) : (
+                        <ChevronDown className="w-4 h-4" />
+                      )}
+                    </div>
+                  </div>
+                </button>
+
+                {expandPelunasanLalu && (
+                  <div className="pt-1">
+                    <div className="divide-y divide-emerald-100 text-xs">
+                      {(showAllPelunasanLalu ? summary.pelunasanBulanLaluList : summary.pelunasanBulanLaluList.slice(0, 3)).map(({ trx, pelunasan, waktuPelunasan }, idx) => (
+                        <div key={idx} className="py-2 flex justify-between items-center">
+                          <div>
+                            <div className="font-bold text-slate-900 flex items-center gap-1.5 flex-wrap">
+                              <span>{trx.namaPelanggan}</span>
+                              <div 
+className="text-[10px] text-slate-800 flex items-center gap-1 max-w-[160px] truncate" title={trx.alamat || '-'}>
+                                  <span className="truncate">{trx.alamat || '-'}</span>
+                              </div>
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              Masuk: {formatShortDate(trx.tanggalMasuk)} • Lunas/Diambil: {formatReceiptDate(waktuPelunasan, true)}
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <span className="font-black text-emerald-700 text-sm tabular-nums">
+                              +{formatRupiah(pelunasan)}
+                            </span>
+                            <p className="text-[10px] text-emerald-600 font-bold uppercase">Masuk Kas {monthNames[new Date(waktuPelunasan).getMonth()]}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {summary.pelunasanBulanLaluList.length > 3 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAllPelunasanLalu(!showAllPelunasanLalu)}
+                        className="w-full mt-2.5 py-1.5 px-2 bg-emerald-100/70 hover:bg-emerald-100 text-emerald-900 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer border border-emerald-200"
+                      >
+                        {showAllPelunasanLalu ? (
+                          <>
+                            <span>Tutup (Hanya 3 Teratas)</span>
+                            <ChevronUp className="w-3.5 h-3.5 text-emerald-700" />
+                          </>
+                        ) : (
+                          <>
+                            <span>Lihat Semua (+{summary.pelunasanBulanLaluList.length - 3} nota lainnya)</span>
+                            <ChevronDown className="w-3.5 h-3.5 text-emerald-700" />
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Data Transaksi Card */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-1 shadow-2xs space-y-1">
+             
+              <div className="grid grid-cols-3 gap-1 pt-0 text-center">
+                <div className="p-1 bg-slate-50 rounded-xl border border-slate-200">
+                  <p className="text-[10px] text-slate-500 font-medium">Total Order {summary.totalTrx}</p>
+                </div>
+                <div className="p-1 bg-emerald-50/60 rounded-xl border border-emerald-200">
+                  <p className="text-[10px] text-emerald-700 font-medium">Lunas {summary.countLunas}</p>
+                </div>
+                <div className="p-1 bg-amber-50/60 rounded-xl border border-amber-200">
+                  <p className="text-[10px] text-amber-700 font-medium">Belum Lunas {summary.countBelumLunas}</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Grid Rekapitulasi (1 kolom di HP, 2 di tablet, 4 di PC) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4 items-start">
+
+                   {/* 4. Pelanggan Terbanyak */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs space-y-2">
+                <div
+                  onClick={() => setExpandPelanggan(!expandPelanggan)}
+                  className="flex justify-between items-center cursor-pointer select-none"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <Award className="w-3.5 h-3.5 text-amber-500" />
+                    <h2 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                      Pelanggan Teratas ({summary.customerList.length})
+                    </h2>
+                  </div>
+                  {expandPelanggan ? (
+                    <ChevronUp className="w-4 h-4 text-slate-400" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-slate-400" />
+                  )}
+                </div>
+
+                {expandPelanggan && (
+                  <div className="pt-1">
+                    {summary.customerList.length === 0 ? (
+                      <p className="text-slate-400 italic text-center py-2 text-xs">Belum ada transaksi</p>
+                    ) : (
+                      <>
+                        <div className="divide-y divide-slate-100 text-xs">
+                          {(showAllPelanggan ? summary.customerList : summary.customerList.slice(0, 3)).map(([name, count], idx) => (
+                            <div key={idx} className="py-2 flex justify-between items-center">
+                              <span className="text-slate-700 truncate pr-2 font-medium">
+                                <span className="text-slate-400 font-bold mr-1">{idx + 1}.</span> {name}
+                              </span>
+                              <span className="font-bold text-[#800000] tabular-nums shrink-0">
+                                {count} <span className="text-[10px] text-slate-500 font-normal">Order</span>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+
+                        {summary.customerList.length > 3 && (
+                          <button
+                            type="button"
+                            onClick={() => setShowAllPelanggan(!showAllPelanggan)}
+                            className="w-full mt-2.5 py-1.5 px-2 bg-slate-50 hover:bg-slate-100 text-slate-700 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1 transition cursor-pointer border border-slate-200"
+                          >
+                            {showAllPelanggan ? (
+                              <>
+                                <span>Tutup (Hanya 3 Teratas)</span>
+                                <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
+                              </>
+                            ) : (
+                              <>
+                                <span>Lihat Semua (+{summary.customerList.length - 3} pelanggan lainnya)</span>
+                                <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+              {/* 1. Rekapitulasi Layanan */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs space-y-2">
+                <div
+                  onClick={() => setExpandLayanan(!expandLayanan)}
+                  className="flex justify-between items-center cursor-pointer select-none"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <Layers className="w-3.5 h-3.5 text-amber-600" />
+                    <h2 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                      Rekap Layanan ({summary.serviceList.length})
+                    </h2>
+                  </div>
+                  {expandLayanan ? (
+                    <ChevronUp className="w-4 h-4 text-slate-400" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-slate-400" />
+                  )}
+                </div>
+
+                {expandLayanan && (
+                  <div className="pt-1">
+                    {summary.serviceList.length === 0 ? (
+                      <p className="text-slate-400 italic text-center py-2 text-xs">Belum ada data layanan</p>
+                    ) : (
+                      <>
+                        <div className="divide-y divide-slate-100 text-xs">
+                          {(showAllLayanan ? summary.serviceList : summary.serviceList.slice(0, 3)).map(([name, weight], idx) => (
+                            <div key={idx} className="py-2 flex justify-between items-center">
+                              <span className="text-slate-700 truncate pr-2 font-medium">
+                                <span className="text-slate-400 font-bold mr-1">{idx + 1}.</span> {name}
+                              </span>
+                              <span className="font-bold text-slate-900 tabular-nums shrink-0">
+                                {weight.toFixed(1)} <span className="text-[10px] text-slate-500 font-normal">Kg/Unit</span>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+
+                        {summary.serviceList.length > 3 && (
+                          <button
+                            type="button"
+                            onClick={() => setShowAllLayanan(!showAllLayanan)}
+                            className="w-full mt-2.5 py-1.5 px-2 bg-slate-50 hover:bg-slate-100 text-slate-700 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1 transition cursor-pointer border border-slate-200"
+                          >
+                            {showAllLayanan ? (
+                              <>
+                                <span>Tutup (Hanya 3 Teratas)</span>
+                                <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
+                              </>
+                            ) : (
+                              <>
+                                <span>Lihat Semua (+{summary.serviceList.length - 3} layanan lainnya)</span>
+                                <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* 2. Ringkasan Kinerja Staf */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs space-y-2">
+                <div
+                  onClick={() => setExpandStaf(!expandStaf)}
+                  className="flex justify-between items-center cursor-pointer select-none"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <Users className="w-3.5 h-3.5 text-blue-600" />
+                    <h2 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                      Kinerja Staf ({summary.staffList.length})
+                    </h2>
+                  </div>
+                  {expandStaf ? (
+                    <ChevronUp className="w-4 h-4 text-slate-400" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-slate-400" />
+                  )}
+                </div>
+
+                {expandStaf && (
+                  <div className="pt-1">
+                    {summary.staffList.length === 0 ? (
+                      <p className="text-slate-400 italic text-center py-2 text-xs">Belum ada staf bertugas</p>
+                    ) : (
+                      <>
+                        <div className="divide-y divide-slate-100 text-xs">
+                          {(showAllStaf ? summary.staffList : summary.staffList.slice(0, 3)).map((staf, idx) => (
+                            <div key={idx} className="py-2 space-y-1">
+                              <div className="flex justify-between items-center">
+                                <span className="font-bold text-slate-800 truncate pr-2 flex items-center gap-1.5">
+                                  <span className={`inline-flex items-center justify-center w-4 h-4 rounded-full text-[9px] font-black ${
+                                    idx === 0 ? 'bg-amber-100 text-amber-800 border border-amber-300' :
+                                    idx === 1 ? 'bg-slate-200 text-slate-700' :
+                                    idx === 2 ? 'bg-orange-100 text-orange-800' :
+                                    'bg-slate-100 text-slate-500'
+                                  }`}>
+                                    {idx + 1}
+                                  </span>
+                                  <span className="truncate">{staf.nama}</span>
+                                </span>
+                                <span className="font-extrabold text-blue-700 tabular-nums shrink-0">
+                                  {staf.totalTrx} <span className="text-[10px] text-slate-500 font-normal">Order</span>
+                                </span>
+                              </div>
+                              <div className="flex justify-between items-center text-[11px] text-slate-500 pl-5.5">
+                                <span>{staf.totalKg.toFixed(1)} Kg • <span className="text-emerald-700 font-semibold">{staf.countSelesai} Selesai</span></span>
+                                <span className="font-bold text-slate-800 tabular-nums">{formatRupiah(staf.totalOmzet)}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {summary.staffList.length > 3 && (
+                          <button
+                            type="button"
+                            onClick={() => setShowAllStaf(!showAllStaf)}
+                            className="w-full mt-2.5 py-1.5 px-2 bg-slate-50 hover:bg-slate-100 text-slate-700 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1 transition cursor-pointer border border-slate-200"
+                          >
+                            {showAllStaf ? (
+                              <>
+                                <span>Tutup (Hanya 3 Teratas)</span>
+                                <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
+                              </>
+                            ) : (
+                              <>
+                                <span>Lihat Semua (+{summary.staffList.length - 3} staf lainnya)</span>
+                                <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* 3. Rekapitulasi Pengeluaran */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs space-y-2">
+                <div
+                  onClick={() => setExpandPengeluaran(!expandPengeluaran)}
+                  className="flex justify-between items-center cursor-pointer select-none"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <DollarSign className="w-3.5 h-3.5 text-red-600" />
+                    <h2 className="text-xs font-extrabold text-slate-800 uppercase tracking-wider">
+                      Rekap Biaya ({summary.expenseList.length})
+                    </h2>
+                  </div>
+                  {expandPengeluaran ? (
+                    <ChevronUp className="w-4 h-4 text-slate-400" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-slate-400" />
+                  )}
+                </div>
+
+                {expandPengeluaran && (
+                  <div className="pt-1">
+                    {summary.expenseList.length === 0 ? (
+                      <p className="text-slate-400 italic text-center py-2 text-xs">Belum ada pengeluaran</p>
+                    ) : (
+                      <>
+                        <div className="divide-y divide-slate-100 text-xs">
+                          {(showAllPengeluaran ? summary.expenseList : summary.expenseList.slice(0, 3)).map(([cat, total], idx) => (
+                            <div key={idx} className="py-2 flex justify-between items-center">
+                              <span className="text-slate-700 truncate pr-2 font-medium">
+                                <span className="text-slate-400 font-bold mr-1">{idx + 1}.</span> {cat}
+                              </span>
+                              <span className="font-bold text-red-600 tabular-nums shrink-0">
+                                {formatRupiah(total)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+
+                        {summary.expenseList.length > 3 && (
+                          <button
+                            type="button"
+                            onClick={() => setShowAllPengeluaran(!showAllPengeluaran)}
+                            className="w-full mt-2.5 py-1.5 px-2 bg-slate-50 hover:bg-slate-100 text-slate-700 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1 transition cursor-pointer border border-slate-200"
+                          >
+                            {showAllPengeluaran ? (
+                              <>
+                                <span>Tutup (Hanya 3 Teratas)</span>
+                                <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
+                              </>
+                            ) : (
+                              <>
+                                <span>Lihat Semua (+{summary.expenseList.length - 3} biaya lainnya)</span>
+                                <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+
+         
+            </div>
+
+            {/* Tombol Tampilkan Rincian Harian */}
+            <button
+              type="button"
+              onClick={() => setShowDailyDetails(!showDailyDetails)}
+              className="w-full py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-xs font-bold text-slate-700 shadow-2xs transition cursor-pointer"
+            >
+              {showDailyDetails ? '▲ Sembunyikan Rincian Harian' : '▼ Tampilkan Rincian Harian'}
+            </button>
+
+            {/* Daily Breakdown Table */}
+            {showDailyDetails && (
+              <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-2xs">
+                <div className="bg-[#800000] text-white px-3 py-2 text-[11px] font-bold grid grid-cols-5 text-center">
+                  <span>Tgl</span>
+                  <span>Trx</span>
+                  <span className="text-right">Masuk</span>
+                  <span className="text-right">Keluar</span>
+                  <span className="text-right">Laba</span>
+                </div>
+                <div className="divide-y divide-slate-100 text-xs">
+                  {summary.dailyRows.length === 0 ? (
+                    <p className="text-slate-400 italic text-center py-4">Tidak ada data harian</p>
+                  ) : (
+                    summary.dailyRows.map(([dateKey, val], idx) => {
+                      const laba = val.masuk - val.keluar;
+                      const dateObj = new Date(dateKey);
+                      return (
+                        <div
+                          key={idx}
+                          className="p-2.5 grid grid-cols-5 text-center items-center hover:bg-slate-50"
+                        >
+                          <span className="font-semibold text-slate-800 text-[11px]">
+                            {dateObj.getDate()} {monthNames[dateObj.getMonth()].slice(0, 3)}
+                          </span>
+                          <span className="text-slate-600 tabular-nums">{val.trxCount}</span>
+                          <span className="text-right font-bold text-emerald-600 tabular-nums">
+                            {formatRupiah(val.masuk).replace('Rp ', '')}
+                          </span>
+                          <span className="text-right font-bold text-red-600 tabular-nums">
+                            {formatRupiah(val.keluar).replace('Rp ', '')}
+                          </span>
+                          <span
+                            className={`text-right font-bold tabular-nums ${
+                              laba >= 0 ? 'text-emerald-700' : 'text-red-700'
+                            }`}
+                          >
+                            {formatRupiah(laba).replace('Rp ', '')}
+                          </span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ======================================================== */}
+        {/* TAB 2: ANALISIS KOMPARASI PRO DENGAN GRAFIK MULTI-MODE   */}
+        {/* ======================================================== */}
+        {activeTab === 'komparasi' && (
+          <div className="space-y-4">
+        
+         {/* 4 Kartu Metrik Komparasi Utama - 2 Baris x 2 Kolom di HP */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-3">
+              {/* 1. Omzet Usaha */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-3 sm:p-4 shadow-2xs space-y-1.5 sm:space-y-2">
+                <div className="flex flex-col xs:flex-row justify-between items-start xs:items-center gap-1">
+                  <span className="text-[11px] sm:text-xs font-bold text-slate-500 truncate">Omzet Usaha</span>
+                  <span
+                    className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-black shrink-0 ${
+                      comparativeAnalytics.omzetGrowth >= 0
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : 'bg-red-100 text-red-800'
+                    }`}
+                  >
+                    {comparativeAnalytics.omzetGrowth >= 0 ? (
+                      <ArrowUpRight className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                    ) : (
+                      <ArrowDownRight className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                    )}
+                    {comparativeAnalytics.omzetGrowth > 0 ? '+' : ''}
+                    {comparativeAnalytics.omzetGrowth.toFixed(1)}%
+                  </span>
+                </div>
+                <p className="text-sm sm:text-lg font-black text-slate-900 tabular-nums truncate">
+                  {formatRupiah(summary.totalOmzet)}
+                </p>
+                <div className="pt-1.5 border-t border-slate-100 text-[10px] sm:text-[11px] text-slate-500 flex justify-between gap-1">
+                  <span className="shrink-0">Lalu:</span>
+                  <span className="font-semibold tabular-nums truncate">{formatRupiah(prevSummary.totalOmzet)}</span>
+                </div>
+                <div className="text-[10px] sm:text-[11px] flex justify-between gap-1">
+                  <span className="shrink-0">Selisih:</span>
+                  <span
+                    className={`font-bold tabular-nums truncate ${
+                      comparativeAnalytics.omzetDiff >= 0 ? 'text-emerald-700' : 'text-red-700'
+                    }`}
+                  >
+                    {comparativeAnalytics.omzetDiff >= 0 ? '+' : ''}
+                    {formatRupiah(comparativeAnalytics.omzetDiff)}
+                  </span>
+                </div>
+              </div>
+
+              {/* 2. Laba Bersih */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-3 sm:p-4 shadow-2xs space-y-1.5 sm:space-y-2">
+                <div className="flex flex-col xs:flex-row justify-between items-start xs:items-center gap-1">
+                  <span className="text-[11px] sm:text-xs font-bold text-slate-500 truncate">Laba Bersih</span>
+                  <span
+                    className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-black shrink-0 ${
+                      comparativeAnalytics.labaGrowth >= 0
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : 'bg-red-100 text-red-800'
+                    }`}
+                  >
+                    {comparativeAnalytics.labaGrowth >= 0 ? (
+                      <ArrowUpRight className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                    ) : (
+                      <ArrowDownRight className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                    )}
+                    {comparativeAnalytics.labaGrowth > 0 ? '+' : ''}
+                    {comparativeAnalytics.labaGrowth.toFixed(1)}%
+                  </span>
+                </div>
+                <p
+                  className={`text-sm sm:text-lg font-black tabular-nums truncate ${
+                    summary.labaBersih >= 0 ? 'text-emerald-700' : 'text-red-700'
+                  }`}
+                >
+                  {formatRupiah(summary.labaBersih)}
+                </p>
+                <div className="pt-1.5 border-t border-slate-100 text-[10px] sm:text-[11px] text-slate-500 flex justify-between gap-1">
+                  <span className="shrink-0">Lalu:</span>
+                  <span className="font-semibold tabular-nums truncate">{formatRupiah(prevSummary.labaBersih)}</span>
+                </div>
+                <div className="text-[10px] sm:text-[11px] flex justify-between gap-1">
+                  <span className="shrink-0">Selisih:</span>
+                  <span
+                    className={`font-bold tabular-nums truncate ${
+                      comparativeAnalytics.labaDiff >= 0 ? 'text-emerald-700' : 'text-red-700'
+                    }`}
+                  >
+                    {comparativeAnalytics.labaDiff >= 0 ? '+' : ''}
+                    {formatRupiah(comparativeAnalytics.labaDiff)}
+                  </span>
+                </div>
+              </div>
+
+              {/* 3. Pengeluaran Operasional */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-3 sm:p-4 shadow-2xs space-y-1.5 sm:space-y-2">
+                <div className="flex flex-col xs:flex-row justify-between items-start xs:items-center gap-1">
+                  <span className="text-[11px] sm:text-xs font-bold text-slate-500 truncate">Beban Pengeluaran</span>
+                  <span
+                    className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-black shrink-0 ${
+                      comparativeAnalytics.expGrowth <= 0
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : 'bg-amber-100 text-amber-800'
+                    }`}
+                  >
+                    {comparativeAnalytics.expGrowth <= 0 ? 'Hemat ' : 'Naik '}
+                    {Math.abs(comparativeAnalytics.expGrowth).toFixed(1)}%
+                  </span>
+                </div>
+                <p className="text-sm sm:text-lg font-black text-red-600 tabular-nums truncate">
+                  {formatRupiah(summary.totalPengeluaran)}
+                </p>
+                <div className="pt-1.5 border-t border-slate-100 text-[10px] sm:text-[11px] text-slate-500 flex justify-between gap-1">
+                  <span className="shrink-0">Lalu:</span>
+                  <span className="font-semibold tabular-nums truncate">{formatRupiah(prevSummary.totalPengeluaran)}</span>
+                </div>
+                <div className="text-[10px] sm:text-[11px] flex justify-between gap-1">
+                  <span className="shrink-0">Selisih:</span>
+                  <span
+                    className={`font-bold tabular-nums truncate ${
+                      comparativeAnalytics.expDiff <= 0 ? 'text-emerald-700' : 'text-red-700'
+                    }`}
+                  >
+                    {comparativeAnalytics.expDiff > 0 ? '+' : ''}
+                    {formatRupiah(comparativeAnalytics.expDiff)}
+                  </span>
+                </div>
+              </div>
+
+              {/* 4. Total Order & Volume Kendaraan */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-3 sm:p-4 shadow-2xs space-y-1.5 sm:space-y-2">
+                <div className="flex flex-col xs:flex-row justify-between items-start xs:items-center gap-1">
+                  <span className="text-[11px] sm:text-xs font-bold text-slate-500 truncate">Order &amp; Volume</span>
+                  <span
+                    className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-black shrink-0 ${
+                      comparativeAnalytics.trxGrowth >= 0
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : 'bg-red-100 text-red-800'
+                    }`}
+                  >
+                    {comparativeAnalytics.trxGrowth > 0 ? '+' : ''}
+                    {comparativeAnalytics.trxGrowth.toFixed(1)}%
+                  </span>
+                </div>
+                <p className="text-xs sm:text-lg font-black text-slate-900 tabular-nums truncate">
+                  {summary.totalTrx} <span className="text-[10px] sm:text-xs text-slate-500 font-normal">Ord</span> ({summary.totalWeight.toFixed(0)} Unit)
+                </p>
+                <div className="pt-1.5 border-t border-slate-100 text-[10px] sm:text-[11px] text-slate-500 flex justify-between gap-1">
+                  <span className="shrink-0">Lalu:</span>
+                  <span className="font-semibold tabular-nums truncate">
+                    {prevSummary.totalTrx} Ord ({prevSummary.totalWeight.toFixed(1)} Kg)
+                  </span>
+                </div>
+                <div className="text-[10px] sm:text-[11px] flex justify-between gap-1">
+                  <span className="shrink-0">Selisih:</span>
+                  <span
+                    className={`font-bold tabular-nums truncate ${
+                      comparativeAnalytics.trxDiff >= 0 ? 'text-emerald-700' : 'text-red-700'
+                    }`}
+                  >
+                    {comparativeAnalytics.trxDiff >= 0 ? '+' : ''}
+                    {comparativeAnalytics.trxDiff} Order
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* ======================================================== */}
+            {/* SUB-NAV 5 MODE GRAFIK VISUAL INTERAKTIF                   */}
+            {/* ======================================================== */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-1.5 shadow-2xs">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 text-xs font-bold">
+                <button
+                  type="button"
+                  onClick={() => setCompareChartMode('batang')}
+                  className={`py-2 px-2 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    compareChartMode === 'batang'
+                      ? 'bg-slate-900 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                  }`}
+                >
+                  <BarChart3 className="w-3.5 h-3.5" />
+                  <span>Batang Finansial</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCompareChartMode('tren')}
+                  className={`py-2 px-2 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    compareChartMode === 'tren'
+                      ? 'bg-slate-900 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                  }`}
+                >
+                  <LineChart className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Kurva Tren</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCompareChartMode('layanan')}
+                  className={`py-2 px-2 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    compareChartMode === 'layanan'
+                      ? 'bg-slate-900 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                  }`}
+                >
+                  <Layers className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Battle Layanan</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCompareChartMode('staf')}
+                  className={`py-2 px-2 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    compareChartMode === 'staf'
+                      ? 'bg-slate-900 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                  }`}
+                >
+                  <Users className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Kinerja Staf</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCompareChartMode('rasio')}
+                  className={`py-2 px-2 rounded-xl flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                    compareChartMode === 'rasio'
+                      ? 'bg-slate-900 text-white shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                  }`}
+                >
+                  <Award className="w-3.5 h-3.5 text-rose-400" />
+                  <span>Rasio Bisnis</span>
+                </button>
+              </div>
+            </div>
+
+            {/* ======================================================== */}
+            {/* GRAFIK 1: GRAFIK BATANG FINANSIAL SIDE-BY-SIDE           */}
+            {/* ======================================================== */}
+            {compareChartMode === 'batang' && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-2xs space-y-5 animate-in fade-in duration-200">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                  <div>
+                    <h4 className="text-xs font-black text-slate-900 uppercase tracking-wider flex items-center gap-1.5">
+                      <BarChart3 className="w-4 h-4 text-[#800000]" />
+                      <span>Grafik Komparasi 4 Pilar Finansial</span>
+                    </h4>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Perbandingan langsung antara {currentPeriodeLabel} dengan {prevPeriodInfo.label}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3 text-xs font-semibold">
+                    <span className="flex items-center gap-1.5 text-slate-800">
+                      <span className="w-3 h-3 rounded-md bg-emerald-600 inline-block" />
+                      <span>Periode Ini</span>
+                    </span>
+                    <span className="flex items-center gap-1.5 text-slate-500">
+                      <span className="w-3 h-3 rounded-md bg-slate-300 inline-block" />
+                      <span>Periode Lalu</span>
+                    </span>
+                  </div>
+                </div>
+
+                {/* 4 Bar Pairs */}
+                <div className="space-y-4 pt-1">
+                  {[
+                    {
+                      label: 'Omzet Usaha',
+                      cur: summary.totalOmzet,
+                      prev: prevSummary.totalOmzet,
+                      growth: comparativeAnalytics.omzetGrowth,
+                      diff: comparativeAnalytics.omzetDiff,
+                      color: 'bg-emerald-600',
+                      textColor: 'text-emerald-700',
+                    },
+                    {
+                      label: 'Total Uang Masuk',
+                      cur: summary.totalUangMasuk,
+                      prev: prevSummary.totalUangMasuk,
+                      growth: comparativeAnalytics.uangMasukGrowth,
+                      diff: comparativeAnalytics.uangMasukDiff,
+                      color: 'bg-emerald-700',
+                      textColor: 'text-emerald-800',
+                    },
+                    {
+                      label: 'Beban Pengeluaran',
+                      cur: summary.totalPengeluaran,
+                      prev: prevSummary.totalPengeluaran,
+                      growth: comparativeAnalytics.expGrowth,
+                      diff: comparativeAnalytics.expDiff,
+                      color: 'bg-rose-500',
+                      textColor: 'text-rose-600',
+                      isExpense: true,
+                    },
+                    {
+                      label: 'Laba Bersih',
+                      cur: summary.labaBersih,
+                      prev: prevSummary.labaBersih,
+                      growth: comparativeAnalytics.labaGrowth,
+                      diff: comparativeAnalytics.labaDiff,
+                      color: summary.labaBersih >= 0 ? 'bg-[#800000]' : 'bg-red-700',
+                      textColor: summary.labaBersih >= 0 ? 'text-[#800000]' : 'text-red-700',
+                    },
+                  ].map((item, idx) => {
+                    const maxPillarVal = Math.max(1, Math.abs(item.cur), Math.abs(item.prev));
+                    const curWidth = Math.max(4, (Math.max(0, item.cur) / maxPillarVal) * 100);
+                    const prevWidth = Math.max(4, (Math.max(0, item.prev) / maxPillarVal) * 100);
+
+                    return (
+                      <div key={idx} className="space-y-1.5 p-3 rounded-xl bg-slate-50 border border-slate-150">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-xs">
+                          <span className="font-extrabold text-slate-800">{item.label}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[11px] text-slate-500">
+                              Selisih: <strong className={item.diff >= 0 ? 'text-emerald-700' : 'text-red-700'}>
+                                {item.diff >= 0 ? '+' : ''}{formatRupiah(item.diff)}
+                              </strong>
+                            </span>
+                            <span className={`px-2 py-0.5 rounded-md text-[10px] font-black ${
+                              item.isExpense
+                                ? item.growth <= 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
+                                : item.growth >= 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                            }`}>
+                              {item.growth > 0 ? '+' : ''}{item.growth.toFixed(1)}%
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Bar Periode Ini */}
+                        <div className="space-y-1 pt-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] font-bold text-slate-500 w-20 shrink-0">Periode Ini:</span>
+                            <div className="flex-1 bg-slate-200/60 rounded-full h-4 overflow-hidden relative">
+                              <div
+                                className={`h-full ${item.color} rounded-full transition-all duration-700`}
+                                style={{ width: `${curWidth}%` }}
+                              />
+                            </div>
+                            <span className={`text-xs font-black tabular-nums w-28 text-right shrink-0 ${item.textColor}`}>
+                              {formatRupiah(item.cur)}
+                            </span>
+                          </div>
+
+                          {/* Bar Periode Lalu */}
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] font-bold text-slate-400 w-20 shrink-0">Periode Lalu:</span>
+                            <div className="flex-1 bg-slate-200/60 rounded-full h-3.5 overflow-hidden relative">
+                              <div
+                                className="h-full bg-slate-400 rounded-full transition-all duration-700"
+                                style={{ width: `${prevWidth}%` }}
+                              />
+                            </div>
+                            <span className="text-xs font-bold tabular-nums text-slate-600 w-28 text-right shrink-0">
+                              {formatRupiah(item.prev)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* ======================================================== */}
+            {/* GRAFIK 2: KURVA TREN AREA INTERAKTIF SVG                  */}
+            {/* ======================================================== */}
+            {compareChartMode === 'tren' && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-2xs space-y-4 animate-in fade-in duration-200">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+                  <div>
+                    <h4 className="text-xs font-black text-slate-900 uppercase tracking-wider flex items-center gap-1.5">
+                      <LineChart className="w-4 h-4 text-emerald-600" />
+                      <span>Kurva Tren Komparasi Dinamis</span>
+                    </h4>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      {trendComparisonData.isYearly ? 'Pola Tren Bulanan (Jan - Des)' : 'Fluktuasi Harian (Tgl 1 s/d Akhir Bulan)'}
+                    </p>
+                  </div>
+
+                  {/* Switcher Metrik Tren */}
+                  <div className="flex items-center bg-slate-100 p-0.5 rounded-xl text-xs font-bold self-start sm:self-auto">
+                    <button
+                      type="button"
+                      onClick={() => setTrendMetric('omzet')}
+                      className={`px-2.5 py-1 rounded-lg transition cursor-pointer ${
+                        trendMetric === 'omzet' ? 'bg-[#800000] text-white shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Omzet
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTrendMetric('uangMasuk')}
+                      className={`px-2.5 py-1 rounded-lg transition cursor-pointer ${
+                        trendMetric === 'uangMasuk' ? 'bg-[#800000] text-white shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Uang Masuk
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTrendMetric('trx')}
+                      className={`px-2.5 py-1 rounded-lg transition cursor-pointer ${
+                        trendMetric === 'trx' ? 'bg-[#800000] text-white shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Order
+                    </button>
+                  </div>
+                </div>
+
+                {/* Matriks Tabel Tren Komparasi (Tabular Data Grid 0ms) */}
+                {(() => {
+                  const { currentPoints, prevPoints } = trendComparisonData;
+                  const getVal = (pt: typeof currentPoints[0]) => {
+                    return trendMetric === 'omzet' ? pt.omzet : trendMetric === 'uangMasuk' ? pt.uangMasuk : pt.trx;
+                  };
+
+                  const totalCur = currentPoints.reduce((sum, pt) => sum + getVal(pt), 0);
+                  const totalPrev = prevPoints.reduce((sum, pt) => sum + getVal(pt), 0);
+                  const totalDiff = totalCur - totalPrev;
+                  const totalGrowth = totalPrev > 0 ? (totalDiff / totalPrev) * 100 : totalCur > 0 ? 100 : 0;
+
+                  return (
+                    <div className="space-y-3">
+                      {/* Ringkasan Delta Header */}
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 p-3 bg-slate-50 rounded-xl border border-slate-200">
+                        <div>
+                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">
+                            Periode Ini
+                          </span>
+                          <span className="text-sm font-black font-mono tabular-nums text-emerald-700">
+                            {trendMetric === 'trx' ? `${totalCur} Order` : formatRupiah(totalCur)}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                            Periode Lalu
+                          </span>
+                          <span className="text-sm font-bold font-mono tabular-nums text-slate-600">
+                            {trendMetric === 'trx' ? `${totalPrev} Order` : formatRupiah(totalPrev)}
+                          </span>
+                        </div>
+                        <div className="sm:text-right">
+                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">
+                            Pertumbuhan (Delta)
+                          </span>
+                          <span
+                            className={`inline-flex items-center gap-1 text-xs font-black px-2 py-0.5 rounded font-mono tabular-nums ${
+                              totalDiff >= 0
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : 'bg-red-100 text-red-800'
+                            }`}
+                          >
+                            <span>{totalDiff >= 0 ? '+' : ''}{totalGrowth.toFixed(1)}%</span>
+                            <span>({totalDiff >= 0 ? '+' : ''}{trendMetric === 'trx' ? `${totalDiff} Order` : formatRupiah(totalDiff)})</span>
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Tabel Rincian Titik Waktu */}
+                      <div className="overflow-x-auto rounded-xl border border-slate-200">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead>
+                            <tr className="bg-slate-100/80 border-b border-slate-200 text-slate-600 font-bold text-[11px] uppercase tracking-wider">
+                              <th className="py-2.5 px-3">Waktu</th>
+                              <th className="py-2.5 px-3 text-right">Periode Ini</th>
+                              <th className="py-2.5 px-3 text-right">Periode Lalu</th>
+                              <th className="py-2.5 px-3 text-right">Selisih (Delta)</th>
+                              <th className="py-2.5 px-3 text-right">Tren (%)</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {currentPoints.map((curPt, i) => {
+                              const prevPt = prevPoints[i] || { omzet: 0, uangMasuk: 0, trx: 0, label: curPt.label };
+                              const curVal = getVal(curPt);
+                              const prvVal = getVal(prevPt);
+                              const diff = curVal - prvVal;
+                              const growth = prvVal > 0 ? (diff / prvVal) * 100 : curVal > 0 ? 100 : 0;
+
+                              return (
+                                <tr key={i} className="hover:bg-slate-50 transition">
+                                  <td className="py-2 px-3 font-bold text-slate-800">
+                                    {curPt.fullLabel || curPt.label}
+                                  </td>
+                                  <td className="py-2 px-3 text-right font-mono font-bold text-emerald-700 tabular-nums">
+                                    {trendMetric === 'trx' ? `${curVal} Order` : formatRupiah(curVal)}
+                                  </td>
+                                  <td className="py-2 px-3 text-right font-mono text-slate-500 tabular-nums">
+                                    {trendMetric === 'trx' ? `${prvVal} Order` : formatRupiah(prvVal)}
+                                  </td>
+                                  <td
+                                    className={`py-2 px-3 text-right font-mono font-bold tabular-nums ${
+                                      diff >= 0 ? 'text-emerald-700' : 'text-red-700'
+                                    }`}
+                                  >
+                                    {diff >= 0 ? '+' : ''}
+                                    {trendMetric === 'trx' ? `${diff} Order` : formatRupiah(diff)}
+                                  </td>
+                                  <td className="py-2 px-3 text-right">
+                                    <span
+                                      className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-black font-mono tabular-nums ${
+                                        diff >= 0
+                                          ? 'bg-emerald-100 text-emerald-800'
+                                          : 'bg-red-100 text-red-800'
+                                      }`}
+                                    >
+                                      {diff >= 0 ? '+' : ''}{growth.toFixed(1)}%
+                                    </span>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <div className="p-2.5 bg-slate-50 text-[11px] text-slate-500 rounded-lg flex items-center justify-between">
+                        <span>💡 Perbandingan waktu tabular dihitung otomatis dari riwayat transaksi.</span>
+                        <span className="font-semibold text-slate-600">Tabular Ultra-Fast</span>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* ======================================================== */}
+            {/* GRAFIK 3: BATTLE LAYANAN (SERVICE PERFORMANCE COMPARISON)*/}
+            {/* ======================================================== */}
+            {compareChartMode === 'layanan' && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-2xs space-y-4 animate-in fade-in duration-200">
+                <div className="border-b border-slate-100 pb-3">
+                  <h4 className="text-xs font-black text-slate-900 uppercase tracking-wider flex items-center gap-1.5">
+                    <Layers className="w-4 h-4 text-amber-600" />
+                    <span>Battle Kinerja Seluruh Layanan (Kg / Unit)</span>
+                  </h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Evaluasi volume pesanan tiap paket layanan antara {currentPeriodeLabel} vs {prevPeriodInfo.label}
+                  </p>
+                </div>
+
+                {serviceComparisonList.length === 0 ? (
+                  <p className="text-xs text-slate-400 italic text-center py-6">
+                    Belum ada data pengerjaan layanan untuk dibandingkan.
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    {serviceComparisonList.map((svc, idx) => {
+                      const maxSvcVal = Math.max(1, ...serviceComparisonList.map((s) => Math.max(s.currentVal, s.prevVal)));
+                      const curWidth = Math.max(3, (svc.currentVal / maxSvcVal) * 100);
+                      const prevWidth = Math.max(3, (svc.prevVal / maxSvcVal) * 100);
+                      const isTopLeader = idx === 0 && svc.currentVal > 0;
+
+                      return (
+                        <div key={idx} className="p-3 rounded-xl bg-slate-50 border border-slate-150 space-y-2">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                            <div className="flex items-center gap-1.5">
+                              {isTopLeader && (
+                                <span className="bg-amber-100 text-amber-800 text-[10px] font-black px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                                  <Award className="w-3 h-3 text-amber-600" />
+                                  <span>Terlaris #1</span>
+                                </span>
+                              )}
+                              <span className="font-black text-xs text-slate-900">{svc.name}</span>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                              <span className="text-[11px] text-slate-500">
+                                Selisih: <strong className={svc.diff >= 0 ? 'text-emerald-700' : 'text-red-700'}>
+                                  {svc.diff >= 0 ? '+' : ''}{svc.diff.toFixed(1)} Unit/Kg
+                                </strong>
+                              </span>
+                              <span className={`px-2 py-0.5 rounded-md text-[10px] font-black ${
+                                svc.growth >= 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'
+                              }`}>
+                                {svc.growth > 0 ? '+' : ''}{svc.growth.toFixed(1)}%
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Dual Horizontal Bars */}
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-bold text-slate-500 w-20 shrink-0">Periode Ini:</span>
+                              <div className="flex-1 bg-slate-200/60 rounded-full h-3 overflow-hidden">
+                                <div
+                                  className="h-full bg-emerald-600 rounded-full transition-all duration-500"
+                                  style={{ width: `${curWidth}%` }}
+                                />
+                              </div>
+                              <span className="text-xs font-black tabular-nums text-emerald-800 w-20 text-right shrink-0">
+                                {svc.currentVal.toFixed(1)} Kg
+                              </span>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-bold text-slate-400 w-20 shrink-0">Periode Lalu:</span>
+                              <div className="flex-1 bg-slate-200/60 rounded-full h-2.5 overflow-hidden">
+                                <div
+                                  className="h-full bg-slate-400 rounded-full transition-all duration-500"
+                                  style={{ width: `${prevWidth}%` }}
+                                />
+                              </div>
+                              <span className="text-xs font-bold tabular-nums text-slate-600 w-20 text-right shrink-0">
+                                {svc.prevVal.toFixed(1)} Kg
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ======================================================== */}
+            {/* GRAFIK 4: EVALUASI & PERINGKAT KINERJA STAF / KASIR      */}
+            {/* ======================================================== */}
+            {compareChartMode === 'staf' && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-2xs space-y-4 animate-in fade-in duration-200">
+                <div className="border-b border-slate-100 pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <h4 className="text-xs font-black text-slate-900 uppercase tracking-wider flex items-center gap-1.5">
+                      <Users className="w-4 h-4 text-blue-600" />
+                      <span>Evaluasi &amp; Peringkat Produktivitas Staf</span>
+                    </h4>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Ringkasan kontribusi beban kerja cuci, order ditangani, dan omzet per staf periode {currentPeriodeLabel}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs font-bold text-slate-600">
+                    <span className="px-2.5 py-1 bg-blue-50 text-blue-700 rounded-lg border border-blue-200">
+                      {summary.staffList.length} Petugas Terlibat
+                    </span>
+                  </div>
+                </div>
+
+                {summary.staffList.length === 0 ? (
+                  <p className="text-xs text-slate-400 italic text-center py-6">
+                    Belum ada data pengerjaan atau penugasan staf pada periode ini.
+                  </p>
+                ) : (
+                  <div className="space-y-3">
+                    {summary.staffList.map((staf, idx) => {
+                      const maxTrx = Math.max(1, ...summary.staffList.map((s) => s.totalTrx));
+                      const maxKg = Math.max(1, ...summary.staffList.map((s) => s.totalKg));
+                      const trxWidth = Math.min(100, (staf.totalTrx / maxTrx) * 100);
+                      const kgWidth = Math.min(100, (staf.totalKg / maxKg) * 100);
+                      const percentOfAllTrx = summary.totalTrx > 0 ? ((staf.totalTrx / summary.totalTrx) * 100).toFixed(1) : '0';
+
+                      return (
+                        <div
+                          key={idx}
+                          className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-slate-50 transition space-y-2.5"
+                        >
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`w-6 h-6 rounded-lg flex items-center justify-center text-xs font-black shrink-0 ${
+                                  idx === 0
+                                    ? 'bg-amber-400 text-amber-950 shadow-2xs'
+                                    : idx === 1
+                                    ? 'bg-slate-300 text-slate-800'
+                                    : idx === 2
+                                    ? 'bg-orange-300 text-orange-900'
+                                    : 'bg-white text-slate-600 border border-slate-200'
+                                }`}
+                              >
+                                {idx + 1}
+                              </span>
+                              <div>
+                                <span className="text-sm font-black text-slate-900">{staf.nama}</span>
+                                <span className="ml-2 text-[11px] font-bold text-blue-600">
+                                  ({percentOfAllTrx}% beban order)
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-2 text-xs font-bold">
+                              <span className="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[11px]">
+                                {staf.countSelesai} Selesai
+                              </span>
+                              {staf.countProses > 0 && (
+                                <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[11px]">
+                                  {staf.countProses} Proses
+                                </span>
+                              )}
+                              <span className="font-black text-slate-900 tabular-nums">
+                                {formatRupiah(staf.totalOmzet)}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Progress bar visual beban kerja */}
+                          <div className="space-y-1.5 pt-1">
+                            <div className="flex items-center gap-2 text-xs">
+                              <span className="text-[10px] font-bold text-slate-500 w-24 shrink-0">
+                                Jumlah Order:
+                              </span>
+                              <div className="flex-1 bg-slate-200/80 rounded-full h-2.5 overflow-hidden">
+                                <div
+                                  className="h-full bg-blue-600 rounded-full transition-all duration-500"
+                                  style={{ width: `${trxWidth}%` }}
+                                />
+                              </div>
+                              <span className="text-xs font-black tabular-nums text-blue-700 w-20 text-right shrink-0">
+                                {staf.totalTrx} Order
+                              </span>
+                            </div>
+
+                            <div className="flex items-center gap-2 text-xs">
+                              <span className="text-[10px] font-bold text-slate-500 w-24 shrink-0">
+                                Volume Cuci:
+                              </span>
+                              <div className="flex-1 bg-slate-200/80 rounded-full h-2.5 overflow-hidden">
+                                <div
+                                  className="h-full bg-indigo-500 rounded-full transition-all duration-500"
+                                  style={{ width: `${kgWidth}%` }}
+                                />
+                              </div>
+                              <span className="text-xs font-black tabular-nums text-indigo-700 w-20 text-right shrink-0">
+                                {staf.totalKg.toFixed(0)} Unit
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ======================================================== */}
+            {/* GRAFIK 5: RASIO KEUANGAN & SKOR KESEHATAN EKSEKUTIF      */}
+            {/* ======================================================== */}
+            {compareChartMode === 'rasio' && (
+              <div className="space-y-4 animate-in fade-in duration-200">
+                {/* Skor Kesehatan Finansial Gauge Card */}
+                <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-2xs flex flex-col sm:flex-row items-center justify-between gap-4">
+                  <div className="space-y-1 text-center sm:text-left">
+                    <span className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center justify-center sm:justify-start gap-1">
+                      <Zap className="w-3.5 h-3.5 text-amber-500" />
+                      <span>Financial Health Index</span>
+                    </span>
+                    <h3 className="text-xl font-black text-slate-900">
+                      Skor Kesehatan Bisnis: <span className="text-[#800000]">{executiveMetrics.healthScore} / 100</span>
+                    </h3>
+                    <div className="pt-1">
+                      <span className={`inline-block px-3 py-1 rounded-xl text-xs font-black border ${executiveMetrics.healthColor}`}>
+                        {executiveMetrics.healthLabel}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Circular/Linear Visual Meter */}
+                  <div className="w-full sm:w-64 space-y-1.5">
+                    <div className="flex justify-between text-[11px] font-bold text-slate-600">
+                      <span>Efisiensi & Stabilitas</span>
+                      <span className="tabular-nums font-black">{executiveMetrics.healthScore}%</span>
+                    </div>
+                    <div className="w-full h-4 bg-slate-100 rounded-full overflow-hidden p-0.5 border border-slate-200">
+                      <div
+                        className={`h-full rounded-full transition-all duration-1000 ${
+                          executiveMetrics.healthScore >= 70
+                            ? 'bg-linear-to-r from-emerald-500 to-teal-600'
+                            : executiveMetrics.healthScore >= 40
+                            ? 'bg-linear-to-r from-amber-400 to-amber-600'
+                            : 'bg-linear-to-r from-rose-500 to-red-700'
+                        }`}
+                        style={{ width: `${executiveMetrics.healthScore}%` }}
+                      />
+                    </div>
+                    <div className="flex justify-between text-[9px] text-slate-400">
+                      <span>Kritis (&lt;40)</span>
+                      <span>Stabil (40-70)</span>
+                      <span>Prima (&gt;70)</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 4 Rasio Kinerja Utama */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* 1. Net Profit Margin */}
+                  <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs space-y-2">
+                    <span className="text-xs font-bold text-slate-500">Net Profit Margin (Margin Laba Bersih)</span>
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-xl font-black text-slate-900 tabular-nums">
+                        {executiveMetrics.currentMargin.toFixed(1)}%
+                      </span>
+                      <span className={`text-xs font-black ${executiveMetrics.marginDiff >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
+                        {executiveMetrics.marginDiff >= 0 ? '+' : ''}{executiveMetrics.marginDiff.toFixed(1)}% vs Lalu
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      Dari setiap Rp 100.000 omzet, Anda mengantongi <strong>{formatRupiah(executiveMetrics.currentMargin * 1000)}</strong> laba bersih.
+                    </p>
+                  </div>
+
+                  {/* 2. Average Order Value (AOV) */}
+                  <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs space-y-2">
+                    <span className="text-xs font-bold text-slate-500">Rata-Rata Nilai Nota (Basket Size / AOV)</span>
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-xl font-black text-slate-900 tabular-nums">
+                        {formatRupiah(executiveMetrics.currentAov)}
+                      </span>
+                      <span className={`text-xs font-black ${executiveMetrics.aovDiff >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
+                        {executiveMetrics.aovDiff >= 0 ? '+' : ''}{formatRupiah(executiveMetrics.aovDiff)}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      Rata-rata pengeluaran satu pelanggan dalam sekali cuci di outlet Anda.
+                    </p>
+                  </div>
+
+                  {/* 3. Cost to Income Ratio */}
+                  <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs space-y-2">
+                    <span className="text-xs font-bold text-slate-500">Rasio Beban Operasional (Cost-to-Income)</span>
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-xl font-black text-slate-900 tabular-nums">
+                        {executiveMetrics.currentCostRatio.toFixed(1)}%
+                      </span>
+                      <span className={`text-xs font-black ${executiveMetrics.currentCostRatio <= executiveMetrics.prevCostRatio ? 'text-emerald-700' : 'text-amber-700'}`}>
+                        {executiveMetrics.currentCostRatio <= executiveMetrics.prevCostRatio ? 'Lebih Efisien' : 'Beban Naik'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      Persentase omzet yang terserap untuk biaya shampo salju, semir ban, air, listrik, dan kru.
+                    </p>
+                  </div>
+
+                  {/* 4. Rata-Rata Beban per Order */}
+                  <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-2xs space-y-2">
+                    <span className="text-xs font-bold text-slate-500">Biaya Operasional per Nota Cuci</span>
+                    <div className="flex items-baseline justify-between">
+                      <span className="text-xl font-black text-slate-900 tabular-nums">
+                        {summary.totalTrx > 0 ? formatRupiah(summary.totalPengeluaran / summary.totalTrx) : 'Rp 0'}
+                      </span>
+                      <span className="text-xs font-bold text-slate-500">
+                        {summary.totalTrx} Nota
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      Estimasi modal operasional yang dikeluarkan untuk menyelesaikan setiap 1 nota pelanggan.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ======================================================== */}
+            {/* REKOMENDASI STRATEGIS EKSEKUTIF BERBASIS DATA RIIL       */}
+            {/* ======================================================== */}
+            <div className="p-4 rounded-2xl bg-amber-50/90 border border-amber-200/90 text-xs text-amber-950 space-y-2.5 shadow-2xs">
+              <div className="flex items-center gap-2 font-black text-amber-900">
+                <Sparkles className="w-4 h-4 text-amber-600 shrink-0 animate-pulse" />
+                <span>Executive Business Intelligence & Saran Strategis:</span>
+              </div>
+              <ul className="space-y-1.5 text-amber-900/90 pl-5 list-disc leading-relaxed text-[11px]">
+                {comparativeAnalytics.omzetGrowth > 0 ? (
+                  <li>
+                    <strong>Pendapatan Meningkat:</strong> Omzet toko Anda mengalami kenaikan sebesar{' '}
+                    <span className="font-bold text-emerald-800">
+                      +{comparativeAnalytics.omzetGrowth.toFixed(1)}% ({formatRupiah(comparativeAnalytics.omzetDiff)})
+                    </span>{' '}
+                    dibanding periode {prevPeriodInfo.label}. Pertahankan kualitas layanan dan ketepatan waktu.
+                  </li>
+                ) : comparativeAnalytics.omzetGrowth < 0 ? (
+                  <li>
+                    <strong>Pendapatan Menurun:</strong> Omzet toko Anda terkoreksi sebesar{' '}
+                    <span className="font-bold text-red-700">
+                      {comparativeAnalytics.omzetGrowth.toFixed(1)}% ({formatRupiah(comparativeAnalytics.omzetDiff)})
+                    </span>
+                    . Disarankan meluncurkan promo bundling akhir pekan atau mengirim pesan pengingat siap cuci ke pelanggan loyal.
+                  </li>
+                ) : (
+                  <li>Pendapatan stabil dan seimbang dengan periode sebelumnya.</li>
+                )}
+
+                {comparativeAnalytics.expDiff > 0 ? (
+                  <li>
+                    <strong>Perhatian Biaya:</strong> Pengeluaran operasional naik sebesar{' '}
+                    <span className="font-bold text-red-700">
+                      +{formatRupiah(comparativeAnalytics.expDiff)} (+{comparativeAnalytics.expGrowth.toFixed(1)}%)
+                    </span>
+                    . Pastikan pembelian sabun/pewangi dalam jumlah grosir dan matikan mesin pengering saat tidak terpakai.
+                  </li>
+                ) : comparativeAnalytics.expDiff < 0 ? (
+                  <li>
+                    <strong>Efisiensi Positif:</strong> Pengeluaran operasional berhasil dihemat sebesar{' '}
+                    <span className="font-bold text-emerald-800">
+                      {formatRupiah(Math.abs(comparativeAnalytics.expDiff))} ({Math.abs(comparativeAnalytics.expGrowth).toFixed(1)}%)
+                    </span>
+                    . Pengendalian modal berjalan efektif!
+                  </li>
+                ) : null}
+
+                <li>
+                  Total pelanggan yang dilayani pada periode ini sebanyak{' '}
+                  <strong>{summary.customerList.length} orang</strong> dengan rata-rata beban{' '}
+                  <strong>
+                    {summary.totalTrx > 0 ? (summary.totalWeight / summary.totalTrx).toFixed(1) : '0'} Kg
+                  </strong>{' '}
+                  per nota.
+                </li>
+              </ul>
+            </div>
+          </div>
+        )}
+
+        {/* ======================================================== */}
+        {/* TAB 3: DASBOR ANALITIK PERFORMA ANTAR-CABANG (D3.JS)     */}
+        {/* ======================================================== */}
+        {activeTab === 'cabang' && (
+          <div className="space-y-4">
+            {/* Header Eksekutif Multi-Cabang */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-2xs space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-red-50 border border-red-200/60 text-[#800000] flex items-center justify-center shrink-0">
+                    <Building2 className="w-5 h-5 text-[#800000]" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-black text-slate-900 tracking-tight">
+                      Dasbor Analitik Performa Antar-Cabang
+                    </h2>
+                    <p className="text-xs text-slate-500">
+                      Visualisasi D3.js perbandingan omzet, kas masuk riil, dan volume order antar-outlet periode {currentPeriodeLabel}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 self-start sm:self-auto">
+                  <span className="text-[11px] font-semibold text-slate-500">
+                    Cabang Terpilih:
+                  </span>
+                  <span className="text-xs font-bold text-[#800000] bg-red-50 border border-red-200/80 px-2.5 py-1 rounded-lg">
+                    {effectiveLaundryName}
+                  </span>
+                </div>
+              </div>
+
+              {/* 3 Kartu Ringkasan Konsolidasi Seluruh Cabang */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 space-y-1">
+                  <span className="text-[11px] font-semibold text-slate-500 block">Total Omzet Konsolidasi</span>
+                  <span className="text-base sm:text-lg font-black text-slate-900 font-mono tabular-nums">
+                    {formatRupiah(branchComparisonData.reduce((sum, b) => sum + b.totalOmzet, 0))}
+                  </span>
+                  <span className="text-[10px] text-slate-400 block">Semua cabang gabungan</span>
+                </div>
+
+                <div className="bg-emerald-50/60 border border-emerald-200/80 rounded-xl p-3 space-y-1">
+                  <span className="text-[11px] font-semibold text-emerald-800 block">Total Kas Masuk Riil</span>
+                  <span className="text-base sm:text-lg font-black text-emerald-700 font-mono tabular-nums">
+                    {formatRupiah(branchComparisonData.reduce((sum, b) => sum + b.totalUangMasuk, 0))}
+                  </span>
+                  <span className="text-[10px] text-emerald-600 block">Uang fisik kasir & transfer</span>
+                </div>
+
+                <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 space-y-1">
+                  <span className="text-[11px] font-semibold text-slate-500 block">Total Volume Pesanan</span>
+                  <span className="text-base sm:text-lg font-black text-slate-900 font-mono tabular-nums">
+                    {branchComparisonData.reduce((sum, b) => sum + b.totalTrx, 0)} Nota
+                  </span>
+                  <span className="text-[10px] text-slate-400 block">{branchComparisonData.length} outlet terdaftar</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Komponen Matriks Komparasi Antar-Cabang (Tabular Data Grid) */}
+            <Suspense
+              fallback={
+                <div className="bg-white rounded-2xl border border-slate-200 p-6 h-72 animate-pulse flex flex-col justify-between">
+                  <div className="h-4 w-48 bg-slate-200/80 rounded" />
+                  <div className="h-48 bg-slate-50 rounded-xl border border-slate-100" />
+                </div>
+              }
+            >
+              <LazyBranchComparisonD3Chart
+                data={branchComparisonData}
+                periodeLabel={currentPeriodeLabel}
+                onSelectBranch={(branchId) => {
+                  if (onSelectBranch) {
+                    onSelectBranch(branchId);
+                    const targetLnd = laundries.find((l) => l.id === branchId);
+                    toast.success(`Beralih ke cabang: ${targetLnd?.namaLaundry || branchId}`);
+                  }
+                }}
+                activeBranchId={activeLaundryId}
+              />
+            </Suspense>
+
+            {/* Panduan Eksekutif untuk Owner */}
+            <div className="bg-amber-50/90 border border-amber-200/90 rounded-2xl p-4 text-xs text-amber-950 space-y-2 shadow-2xs">
+              <div className="flex items-center gap-2 font-black text-amber-900">
+                <Sparkles className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>Tips Eksekutif Pengelolaan Multi-Cabang:</span>
+              </div>
+              <ul className="space-y-1.5 text-amber-900/90 pl-5 list-disc leading-relaxed text-[11px]">
+                <li>
+                  <strong>Identifikasi Cabang Juara:</strong> Outlet dengan lencana Peringkat #1 adalah outlet paling produktif pada periode {currentPeriodeLabel}. Evaluasi SOP dan keramahan staf di cabang tersebut untuk diterapkan di cabang lainnya.
+                </li>
+                <li>
+                  <strong>Cek Selisih Omzet vs Kas Masuk:</strong> Gunakan tombol filter metrik <em>"Uang Kas Masuk"</em> untuk memastikan tidak ada piutang atau pembayaran tertunda yang terlalu besar pada cabang tertentu.
+                </li>
+                <li>
+                  <strong>Klik Baris Cabang:</strong> Anda dapat langsung menyentuh/mengklik baris nama cabang di tabel untuk beralih dan memeriksa pembukuan spesifik cabang tersebut.
+                </li>
+              </ul>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Modal Pratinjau Dokumen & Cetak PDF Resmi (Code-Split Lazy Chunk) */}
+      {showPdfModal && (
+        <Suspense fallback={null}>
+          <LazyReportPdfModal
+            isOpen={showPdfModal}
+            onClose={() => setShowPdfModal(false)}
+            data={pdfPayload}
+          />
+        </Suspense>
+      )}
+    </div>
+  );
+};
